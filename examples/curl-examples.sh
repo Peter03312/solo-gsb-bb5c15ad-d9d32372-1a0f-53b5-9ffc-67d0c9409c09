@@ -143,6 +143,59 @@ curl -s "$BASE/permissions/vouchers/example-voucher-1/proof"; echo
 say "证明包：未知凭证 -> 404 not_found（不留任何证明行）"
 curl -s -X POST "$BASE/permissions/vouchers/no-such-voucher/proof"; echo
 
+say "订阅准备：登记独立示例版本 example-sub-leaf（父版本 example-sub-root，root 仅允许 research）"
+curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' \
+  -d '{"version_id":"example-sub-root","parent_ids":[],"note":"订阅示例根版本"}' >/dev/null; true
+curl -s -X POST "$BASE/license-changes" -H 'Content-Type: application/json' \
+  -d '{"change_id":"example-chg-sr-1","version_id":"example-sub-root","effective_at":"2026-01-01T00:00:00Z","allowed_uses":["research"]}' >/dev/null; true
+curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' \
+  -d '{"version_id":"example-sub-leaf","parent_ids":["example-sub-root"],"note":"订阅示例派生版本"}' >/dev/null; true
+curl -s -X POST "$BASE/license-changes" -H 'Content-Type: application/json' \
+  -d '{"change_id":"example-chg-sl-1","version_id":"example-sub-leaf","effective_at":"2026-01-01T00:00:00Z","allowed_uses":["research","review"]}' >/dev/null; true
+
+say "订阅：关注 example-sub-leaf 的 review @ 2026-05-01（基线被 root 拒绝，201，拒绝也留基线）"
+curl -s -X POST "$BASE/permissions/subscriptions" -H 'Content-Type: application/json' \
+  -d '{"subscription_id":"example-sub-1","version_id":"example-sub-leaf","use":" review ","at":"2026-05-01T08:00:00+08:00"}'; echo
+
+say "订阅重试：去空格用途 + 同一 UTC 瞬间（+08:00 与 Z 等价）-> 200 replayed=true，原订阅逐字段一致"
+curl -s -X POST "$BASE/permissions/subscriptions" -H 'Content-Type: application/json' \
+  -d '{"subscription_id":"example-sub-1","version_id":"example-sub-leaf","use":"review","at":"2026-05-01T00:00:00Z"}'; echo
+
+say "订阅冲突：同一标识换用途 -> 409（原订阅不变）"
+curl -s -X POST "$BASE/permissions/subscriptions" -H 'Content-Type: application/json' \
+  -d '{"subscription_id":"example-sub-1","version_id":"example-sub-leaf","use":"research","at":"2026-05-01T00:00:00Z"}'; echo
+
+say "订阅错误 1：未知版本 -> 404，不留订阅"
+curl -s -X POST "$BASE/permissions/subscriptions" -H 'Content-Type: application/json' \
+  -d '{"subscription_id":"example-sub-x","version_id":"no-such-version","use":"research","at":"2026-05-01T00:00:00Z"}'; echo
+
+say "订阅错误 2：无时区时刻 -> 422，不留订阅"
+curl -s -X POST "$BASE/permissions/subscriptions" -H 'Content-Type: application/json' \
+  -d '{"subscription_id":"example-sub-x","version_id":"example-sub-leaf","use":"research","at":"2026-05-01T00:00:00"}'; echo
+
+say "订阅错误 3：未知订阅的事件 -> 404"
+curl -s "$BASE/permissions/subscriptions/no-such-sub/events"; echo
+
+say "触发翻转：example-sub-root 自 2026-03-01 起放开 review -> 同事务追加事件 seq=1（deny->allow）"
+curl -s -X POST "$BASE/license-changes" -H 'Content-Type: application/json' \
+  -d '{"change_id":"example-chg-sr-2","version_id":"example-sub-root","effective_at":"2026-03-01T00:00:00Z","allowed_uses":["research","review"]}'; echo
+
+say "事件流：按序号游标读取（seq 严格递增，含触发操作、前后状态与阻断原因）"
+curl -s "$BASE/permissions/subscriptions/example-sub-1/events?cursor=0&limit=10"; echo
+
+say "提交重试不产生重复事件：重放 example-chg-sr-2 -> 200 replayed，事件仍只有 seq=1"
+curl -s -X POST "$BASE/license-changes" -H 'Content-Type: application/json' \
+  -d '{"change_id":"example-chg-sr-2","version_id":"example-sub-root","effective_at":"2026-03-01T00:00:00Z","allowed_uses":["research","review"]}' >/dev/null
+curl -s "$BASE/permissions/subscriptions/example-sub-1/events?cursor=0&limit=10"; echo
+
+say "订阅详情：基线不变（baseline_allowed=false），当前状态已翻转为允许，last_event_seq=1"
+curl -s "$BASE/permissions/subscriptions/example-sub-1"; echo
+
+say "作废触发翻转：作废 example-chg-sr-2 -> 再次翻转，同事务追加事件 seq=2（allow->deny）"
+curl -s -X POST "$BASE/license-changes/revocations" -H 'Content-Type: application/json' \
+  -d '{"change_id":"example-chg-sr-2","revocation_id":"rev-example-chg-sr-2","reason":"示例：撤回放宽"}'; echo
+curl -s "$BASE/permissions/subscriptions/example-sub-1/events?cursor=1&limit=10"; echo
+
 say "公钥：列出全部保留公钥（含轮换前旧公钥）与当前活跃密钥"
 curl -s "$BASE/signing/keys"; echo
 

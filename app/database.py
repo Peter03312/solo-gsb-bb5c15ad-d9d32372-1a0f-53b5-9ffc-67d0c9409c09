@@ -91,12 +91,50 @@ SCHEMA_STATEMENTS = [
         proof_json      TEXT NOT NULL
     )
     """,
+    # A permission subscription pins one (version, use, instant) question and
+    # tracks its allowed state over time. The baseline decision is frozen at
+    # creation in the same write transaction as the row itself; last_allowed /
+    # last_state_json are the currently tracked state, refreshed by every
+    # change/revocation that touches the subscription's ancestor closure.
+    """
+    CREATE TABLE IF NOT EXISTS permission_subscriptions (
+        subscription_id  TEXT PRIMARY KEY,
+        version_id       TEXT NOT NULL REFERENCES versions(version_id),
+        use_name         TEXT NOT NULL,
+        at_value         TEXT NOT NULL,
+        registered_at    TEXT NOT NULL,
+        baseline_allowed INTEGER NOT NULL,
+        baseline_json    TEXT NOT NULL,
+        last_allowed     INTEGER NOT NULL,
+        last_state_json  TEXT NOT NULL
+    )
+    """,
+    # One immutable row per allowed-state flip of a subscription, appended in
+    # the same transaction as the triggering change/revocation. seq is
+    # strictly increasing per subscription and backs the stable read cursor;
+    # replays never insert, so one flip is recorded exactly once.
+    """
+    CREATE TABLE IF NOT EXISTS subscription_events (
+        subscription_id      TEXT NOT NULL REFERENCES permission_subscriptions(subscription_id),
+        seq                  INTEGER NOT NULL,
+        trigger_kind         TEXT NOT NULL,
+        trigger_id           TEXT NOT NULL,
+        before_allowed       INTEGER NOT NULL,
+        after_allowed        INTEGER NOT NULL,
+        before_blockers_json TEXT NOT NULL,
+        after_blockers_json  TEXT NOT NULL,
+        registered_at        TEXT NOT NULL,
+        PRIMARY KEY (subscription_id, seq)
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_changes_version_time "
     "ON license_changes(version_id, effective_at)",
     "CREATE INDEX IF NOT EXISTS idx_parents_version ON version_parents(version_id)",
     "CREATE INDEX IF NOT EXISTS idx_parents_parent ON version_parents(parent_id)",
     "CREATE INDEX IF NOT EXISTS idx_revocations_change ON change_revocations(change_id)",
     "CREATE INDEX IF NOT EXISTS idx_vouchers_version ON permission_vouchers(version_id)",
+    "CREATE INDEX IF NOT EXISTS idx_subscriptions_version "
+    "ON permission_subscriptions(version_id)",
 ]
 
 
@@ -371,4 +409,124 @@ class Database:
             "(voucher_id, key_id, algorithm, exported_at, proof_json) "
             "VALUES (?, ?, ?, ?, ?)",
             (voucher_id, key_id, algorithm, exported_at, proof_json),
+        )
+
+    # -- permission subscriptions -------------------------------------------
+
+    def get_subscription(self, subscription_id: str) -> dict[str, Any] | None:
+        return self.query_one(
+            "SELECT * FROM permission_subscriptions WHERE subscription_id = ?",
+            (subscription_id,),
+        )
+
+    def insert_subscription(
+        self,
+        subscription_id: str,
+        version_id: str,
+        use_name: str,
+        at_value: str,
+        registered_at: str,
+        baseline_allowed: bool,
+        baseline_json: str,
+    ) -> None:
+        # The tracked state starts out identical to the frozen baseline.
+        self._conn.execute(
+            "INSERT INTO permission_subscriptions "
+            "(subscription_id, version_id, use_name, at_value, registered_at, "
+            "baseline_allowed, baseline_json, last_allowed, last_state_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                subscription_id,
+                version_id,
+                use_name,
+                at_value,
+                registered_at,
+                1 if baseline_allowed else 0,
+                baseline_json,
+                1 if baseline_allowed else 0,
+                baseline_json,
+            ),
+        )
+
+    def list_subscriptions_for_versions(
+        self, version_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        """All subscriptions pinned to any of the given versions."""
+        if not version_ids:
+            return []
+        marks = ", ".join("?" for _ in version_ids)
+        return self.query_all(
+            f"SELECT * FROM permission_subscriptions WHERE version_id IN ({marks}) "
+            "ORDER BY subscription_id",
+            tuple(version_ids),
+        )
+
+    def update_subscription_state(
+        self, subscription_id: str, last_allowed: bool, last_state_json: str
+    ) -> None:
+        self._conn.execute(
+            "UPDATE permission_subscriptions "
+            "SET last_allowed = ?, last_state_json = ? WHERE subscription_id = ?",
+            (1 if last_allowed else 0, last_state_json, subscription_id),
+        )
+
+    def next_subscription_event_seq(self, subscription_id: str) -> int:
+        """Next per-subscription sequence number (1 when no events yet).
+
+        Writers are serialised by the service lock and the open write
+        transaction, so MAX+1 cannot race; the primary key is the backstop.
+        """
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM subscription_events "
+            "WHERE subscription_id = ?",
+            (subscription_id,),
+        ).fetchone()
+        return int(row["next_seq"])
+
+    def max_subscription_event_seq(self, subscription_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM subscription_events "
+            "WHERE subscription_id = ?",
+            (subscription_id,),
+        ).fetchone()
+        return int(row["max_seq"])
+
+    def insert_subscription_event(
+        self,
+        subscription_id: str,
+        seq: int,
+        trigger_kind: str,
+        trigger_id: str,
+        before_allowed: bool,
+        after_allowed: bool,
+        before_blockers_json: str,
+        after_blockers_json: str,
+        registered_at: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO subscription_events "
+            "(subscription_id, seq, trigger_kind, trigger_id, before_allowed, "
+            "after_allowed, before_blockers_json, after_blockers_json, registered_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                subscription_id,
+                seq,
+                trigger_kind,
+                trigger_id,
+                1 if before_allowed else 0,
+                1 if after_allowed else 0,
+                before_blockers_json,
+                after_blockers_json,
+                registered_at,
+            ),
+        )
+
+    def list_subscription_events(
+        self, subscription_id: str, after_seq: int, limit: int
+    ) -> list[dict[str, Any]]:
+        """Events with ``seq > after_seq`` in stable, strictly increasing order."""
+        return self.query_all(
+            "SELECT * FROM subscription_events "
+            "WHERE subscription_id = ? AND seq > ? ORDER BY seq LIMIT ?",
+            (subscription_id, after_seq, limit),
         )

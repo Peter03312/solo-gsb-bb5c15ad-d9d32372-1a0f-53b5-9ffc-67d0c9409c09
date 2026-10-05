@@ -175,6 +175,39 @@ def _thaw_decision(blob: str) -> dict[str, Any]:
     }
 
 
+def _freeze_blockers(blockers: list[dict[str, Any]]) -> str:
+    """Serialise blocker entries (datetimes -> canonical UTC) to JSON."""
+    payload = [
+        {
+            "version_id": entry["version_id"],
+            "reason": entry["reason"],
+            "change_id": entry.get("change_id"),
+            "effective_at": to_canonical(entry["effective_at"])
+            if entry.get("effective_at") is not None
+            else None,
+            "allowed_uses": list(entry.get("allowed_uses", ())),
+        }
+        for entry in blockers
+    ]
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _thaw_blockers(blob: str) -> list[dict[str, Any]]:
+    """Inverse of :func:`_freeze_blockers` for stored subscription events."""
+    return [
+        {
+            "version_id": entry["version_id"],
+            "reason": entry["reason"],
+            "change_id": entry.get("change_id"),
+            "effective_at": parse_canonical(entry["effective_at"])
+            if entry.get("effective_at") is not None
+            else None,
+            "allowed_uses": list(entry.get("allowed_uses", ())),
+        }
+        for entry in json.loads(blob)
+    ]
+
+
 def _proof_payload(voucher_row: dict[str, Any]) -> dict[str, Any]:
     """Build the signed payload for a voucher proof.
 
@@ -367,6 +400,15 @@ class LicenseService:
             try:
                 self.db.begin()
                 self.db.insert_change(change_id, version_id, effective, uses, digest, created)
+                # Subscription flips are recorded in the same transaction, so
+                # a committed change and its events are atomic — and a replay
+                # (which returns above) never appends anything.
+                self._refresh_subscriptions(
+                    trigger_kind="change",
+                    trigger_id=change_id,
+                    changed_version_id=version_id,
+                    effective_canonical=effective,
+                )
                 self.db.commit()
             except Exception:
                 self.db.rollback()
@@ -472,6 +514,14 @@ class LicenseService:
             try:
                 self.db.begin()
                 self.db.insert_revocation(revocation_id, change_id, reason, registered)
+                # Same-transaction flip recording: the revocation and the
+                # events it triggers commit or roll back together.
+                self._refresh_subscriptions(
+                    trigger_kind="revocation",
+                    trigger_id=revocation_id,
+                    changed_version_id=target["version_id"],
+                    effective_canonical=target["effective_at"],
+                )
                 self.db.commit()
             except Exception:
                 self.db.rollback()
@@ -864,6 +914,232 @@ class LicenseService:
             "at": parse_canonical(row["at_value"]),
             "registered_at": parse_canonical(row["registered_at"]),
             **decision,
+        }
+
+    # -- permission subscriptions (flip event stream) ----------------------
+
+    def create_subscription(
+        self,
+        subscription_id: str | None,
+        version_id: str,
+        use: str,
+        at: datetime,
+    ) -> tuple[dict[str, Any], bool]:
+        """Create a subscription and atomically freeze its baseline decision.
+
+        The first request for ``subscription_id`` evaluates the pinned
+        (version, trimmed use, UTC instant) question under the existing
+        decision rules inside one ``BEGIN IMMEDIATE`` write transaction and
+        stores the resulting allowed state as the baseline — allow and deny
+        alike. Evaluation and insert commit or roll back together, so a
+        concurrent change either lands before the baseline (and is part of
+        it) or after it (and later produces an event) — never both, never
+        neither.
+
+        A retry with the same id, version, trimmed use and UTC-normalised
+        instant returns the original subscription (``replayed=True``);
+        reusing the id against different inputs is a conflict. Unknown
+        version, empty use or naive time error out before any row is written.
+        """
+        if at.tzinfo is None:
+            raise InvalidTimeError("判定时刻必须带时区信息")
+        use = use.strip()
+        if not use:
+            raise ServiceError("用途不能为空")
+        subscription_id = subscription_id or f"s-{uuid.uuid4().hex}"
+        at_canonical = to_canonical(at)
+
+        with self.db.lock:
+            existing = self.db.get_subscription(subscription_id)
+            if existing is not None:
+                same = (
+                    existing["version_id"] == version_id
+                    and existing["use_name"] == use
+                    and existing["at_value"] == at_canonical
+                )
+                if not same:
+                    raise ConflictError(
+                        "同一订阅标识已存在但输入不同（订阅标识不可复用指向不同关注）",
+                        {
+                            "subscription_id": subscription_id,
+                            "submitted_version_id": version_id,
+                            "existing_version_id": existing["version_id"],
+                            "submitted_use": use,
+                            "existing_use": existing["use_name"],
+                            "submitted_at": at_canonical,
+                            "existing_at": existing["at_value"],
+                        },
+                    )
+                return self._subscription_out(existing), True
+
+            try:
+                self.db.begin()
+                if self.db.get_version(version_id) is None:
+                    raise NotFoundError(
+                        "版本不存在，无法建立订阅", {"version_id": version_id}
+                    )
+                state = self.check_permission(version_id, use, at)
+                registered = to_canonical(now_utc())
+                self.db.insert_subscription(
+                    subscription_id=subscription_id,
+                    version_id=version_id,
+                    use_name=use,
+                    at_value=at_canonical,
+                    registered_at=registered,
+                    baseline_allowed=state["allowed"],
+                    baseline_json=_freeze_decision(state),
+                )
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                # A concurrent writer may have won the same primary key: map
+                # the race onto replay/conflict exactly like a sequential call.
+                raced = self.db.get_subscription(subscription_id)
+                if raced is not None:
+                    same = (
+                        raced["version_id"] == version_id
+                        and raced["use_name"] == use
+                        and raced["at_value"] == at_canonical
+                    )
+                    if same:
+                        return self._subscription_out(raced), True
+                    raise ConflictError(
+                        "同一订阅标识已存在但输入不同（订阅标识不可复用指向不同关注）",
+                        {
+                            "subscription_id": subscription_id,
+                            "submitted_version_id": version_id,
+                            "existing_version_id": raced["version_id"],
+                        },
+                    ) from None
+                raise
+
+            stored = self.db.get_subscription(subscription_id)
+            assert stored is not None
+            return self._subscription_out(stored), False
+
+    def get_subscription(self, subscription_id: str) -> dict[str, Any]:
+        """Return a subscription with its baseline and current tracked state."""
+        row = self.db.get_subscription(subscription_id)
+        if row is None:
+            raise NotFoundError("订阅不存在", {"subscription_id": subscription_id})
+        return self._subscription_out(row)
+
+    def list_subscription_events(
+        self, subscription_id: str, cursor: int, limit: int
+    ) -> dict[str, Any]:
+        """Read flip events after ``cursor`` in stable seq order.
+
+        ``cursor`` is the last consumed sequence number (0 reads from the
+        beginning). Events come back strictly ordered by ``seq`` together
+        with ``next_cursor`` — the seq of the last returned event, or the
+        passed cursor unchanged when no new events exist — so clients can
+        page without skipping or re-reading a flip.
+        """
+        if cursor < 0:
+            raise ServiceError("游标必须是非负整数（已消费的最后一个事件序号）")
+        if limit < 1:
+            raise ServiceError("limit 必须至少为 1")
+        if self.db.get_subscription(subscription_id) is None:
+            raise NotFoundError("订阅不存在", {"subscription_id": subscription_id})
+        rows = self.db.list_subscription_events(subscription_id, cursor, limit)
+        events = [self._event_out(row) for row in rows]
+        next_cursor = events[-1]["seq"] if events else cursor
+        return {
+            "subscription_id": subscription_id,
+            "events": events,
+            "next_cursor": next_cursor,
+        }
+
+    def _refresh_subscriptions(
+        self,
+        *,
+        trigger_kind: str,
+        trigger_id: str,
+        changed_version_id: str,
+        effective_canonical: str,
+    ) -> None:
+        """Re-evaluate subscriptions affected by a just-written change/revocation.
+
+        Must run inside the caller's open write transaction: each flip's
+        event row and the subscription's tracked state commit (or roll back)
+        together with the triggering write, so one flip is recorded exactly
+        once and retries never duplicate an event. Only allowed-state flips
+        append an event; non-flip re-evaluations just keep the tracked state
+        current so the next flip reports accurate before-blockers.
+        """
+        affected = self._descendants_inclusive(changed_version_id)
+        subscriptions = self.db.list_subscriptions_for_versions(affected)
+        for sub in subscriptions:
+            if sub["at_value"] < effective_canonical:
+                # The trigger takes effect at its effective instant; a
+                # decision pinned earlier cannot be altered by it.
+                continue
+            state = self.check_permission(
+                sub["version_id"], sub["use_name"], parse_canonical(sub["at_value"])
+            )
+            after_allowed = bool(state["allowed"])
+            before_allowed = bool(sub["last_allowed"])
+            if after_allowed != before_allowed:
+                before_blockers = _thaw_decision(sub["last_state_json"])["blockers"]
+                self.db.insert_subscription_event(
+                    subscription_id=sub["subscription_id"],
+                    seq=self.db.next_subscription_event_seq(sub["subscription_id"]),
+                    trigger_kind=trigger_kind,
+                    trigger_id=trigger_id,
+                    before_allowed=before_allowed,
+                    after_allowed=after_allowed,
+                    before_blockers_json=_freeze_blockers(before_blockers),
+                    after_blockers_json=_freeze_blockers(state["blockers"]),
+                    registered_at=to_canonical(now_utc()),
+                )
+            self.db.update_subscription_state(
+                sub["subscription_id"], after_allowed, _freeze_decision(state)
+            )
+
+    def _descendants_inclusive(self, version_id: str) -> list[str]:
+        """The version itself plus every transitive descendant, deduplicated."""
+        order: list[str] = []
+        seen = {version_id}
+        queue: deque[str] = deque([version_id])
+        while queue:
+            current = queue.popleft()
+            order.append(current)
+            for child in self.db.get_children(current):
+                if child not in seen:
+                    seen.add(child)
+                    queue.append(child)
+        return order
+
+    def _subscription_out(self, row: dict[str, Any]) -> dict[str, Any]:
+        baseline = _thaw_decision(row["baseline_json"])
+        current = _thaw_decision(row["last_state_json"])
+        return {
+            "subscription_id": row["subscription_id"],
+            "version_id": row["version_id"],
+            "use": row["use_name"],
+            "at": parse_canonical(row["at_value"]),
+            "registered_at": parse_canonical(row["registered_at"]),
+            "baseline_allowed": bool(row["baseline_allowed"]),
+            "baseline_blockers": baseline["blockers"],
+            "current_allowed": bool(row["last_allowed"]),
+            "current_blockers": current["blockers"],
+            "last_event_seq": self.db.max_subscription_event_seq(
+                row["subscription_id"]
+            ),
+        }
+
+    @staticmethod
+    def _event_out(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "subscription_id": row["subscription_id"],
+            "seq": int(row["seq"]),
+            "trigger_kind": row["trigger_kind"],
+            "trigger_id": row["trigger_id"],
+            "before_allowed": bool(row["before_allowed"]),
+            "after_allowed": bool(row["after_allowed"]),
+            "before_blockers": _thaw_blockers(row["before_blockers_json"]),
+            "after_blockers": _thaw_blockers(row["after_blockers_json"]),
+            "registered_at": parse_canonical(row["registered_at"]),
         }
 
     # -- change preview (no writes) ---------------------------------------

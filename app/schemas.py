@@ -236,6 +236,82 @@ class VoucherResponse(BaseModel):
     voucher: VoucherDecision
 
 
+# -- permission subscriptions (flip event stream) ---------------------------
+
+
+class SubscriptionCreateRequest(BaseModel):
+    subscription_id: str | None = Field(
+        default=None, min_length=1, max_length=128, description="唯一订阅标识；省略时自动生成 UUID"
+    )
+    version_id: str = Field(min_length=1, description="已登记的数据集版本")
+    use: str = Field(min_length=1, description="关注的用途（去首尾空格后判定与保存）")
+    at: datetime = Field(description="带时区的固定判定时刻，服务统一换算为 UTC 归一化")
+
+    _check_time = field_validator("at")(_ensure_aware)
+
+    @field_validator("use")
+    @classmethod
+    def _use(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("use 不能为空白字符串")
+        return value
+
+
+class SubscriptionState(BaseModel):
+    """一个许可状态订阅：固定的判定问题、基线与当前跟踪状态。"""
+
+    subscription_id: str = Field(description="唯一订阅标识")
+    version_id: str
+    use: str
+    at: datetime = Field(description="换算为 UTC 后的固定判定时刻")
+    registered_at: datetime = Field(description="订阅建立时间（服务按 UTC 生成）")
+    baseline_allowed: bool = Field(description="建立时原子保存的允许状态基线")
+    baseline_blockers: list[BlockerEntry] = Field(
+        default_factory=list, description="建立时的全部阻断版本与原因（允许时为空）"
+    )
+    current_allowed: bool = Field(description="按当前数据跟踪的允许状态")
+    current_blockers: list[BlockerEntry] = Field(
+        default_factory=list, description="当前的全部阻断版本与原因（允许时为空）"
+    )
+    last_event_seq: int = Field(description="已追加的最后一个事件序号（尚无事件时为 0）")
+
+
+class SubscriptionResponse(BaseModel):
+    replayed: bool = Field(description="同标识与同输入重试时为 true，返回原订阅")
+    subscription: SubscriptionState
+
+
+class SubscriptionEvent(BaseModel):
+    """一次允许状态翻转的持久事件（与触发写入同一事务追加，不可变）。"""
+
+    subscription_id: str
+    seq: int = Field(description="订阅内严格递增的序号，从 1 开始")
+    trigger_kind: Literal["change", "revocation"] = Field(
+        description="触发操作类型：许可变更 / 变更作废"
+    )
+    trigger_id: str = Field(description="触发操作的标识（变更标识或作废标识）")
+    before_allowed: bool = Field(description="触发前的允许状态")
+    after_allowed: bool = Field(description="触发后的允许状态")
+    before_blockers: list[BlockerEntry] = Field(
+        default_factory=list, description="触发前的全部阻断版本与原因"
+    )
+    after_blockers: list[BlockerEntry] = Field(
+        default_factory=list, description="触发后的全部阻断版本与原因"
+    )
+    registered_at: datetime = Field(description="事件登记时间（服务按 UTC 生成）")
+
+
+class SubscriptionEventsResponse(BaseModel):
+    subscription_id: str
+    events: list[SubscriptionEvent] = Field(
+        default_factory=list, description="按序号严格递增的稳定顺序"
+    )
+    next_cursor: int = Field(
+        description="下一游标：本次最后一个事件的序号；无新事件时与入参游标相同"
+    )
+
+
 # -- signed voucher proof packages -----------------------------------------
 
 

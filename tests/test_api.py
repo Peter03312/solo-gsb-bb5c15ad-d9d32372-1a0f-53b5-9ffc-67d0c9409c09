@@ -1918,3 +1918,500 @@ def test_proof_on_demo_seed(tmp_path):
         }
         ok, message = verify_proof_package(pkg)
         assert ok, message
+
+
+# -- permission subscriptions (flip event stream) ----------------------------
+
+
+def _subscribe(client, subscription_id, version_id, use, at):
+    return client.post(
+        "/permissions/subscriptions",
+        json={
+            "subscription_id": subscription_id,
+            "version_id": version_id,
+            "use": use,
+            "at": at,
+        },
+    )
+
+
+def _get_subscription(client, subscription_id):
+    return client.get(f"/permissions/subscriptions/{subscription_id}")
+
+
+def _events(client, subscription_id, cursor=0, limit=100):
+    return client.get(
+        f"/permissions/subscriptions/{subscription_id}/events",
+        params={"cursor": cursor, "limit": limit},
+    )
+
+
+def test_subscription_create_saves_baseline_allow_and_deny(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+
+    allowed = _subscribe(client, "s-ok", "a", "research", _iso(2026, 5, 1))
+    assert allowed.status_code == 201, allowed.text
+    body = allowed.json()
+    assert body["replayed"] is False
+    sub = body["subscription"]
+    assert sub["subscription_id"] == "s-ok"
+    assert sub["version_id"] == "a"
+    assert sub["use"] == "research"
+    assert sub["at"] == _iso(2026, 5, 1)
+    assert sub["registered_at"].startswith("20")
+    assert sub["baseline_allowed"] is True
+    assert sub["baseline_blockers"] == []
+    assert sub["current_allowed"] is True
+    assert sub["current_blockers"] == []
+    assert sub["last_event_seq"] == 0
+
+    # Denied baselines are saved too — with the blocking reasons.
+    denied = _subscribe(client, "s-no", "a", "review", _iso(2026, 5, 1))
+    assert denied.status_code == 201
+    dsub = denied.json()["subscription"]
+    assert dsub["baseline_allowed"] is False
+    assert dsub["current_allowed"] is False
+    assert dsub["baseline_blockers"] == [
+        {
+            "version_id": "a",
+            "reason": "use_not_allowed",
+            "change_id": "ca",
+            "effective_at": _iso(2026, 1, 1),
+            "allowed_uses": ["research"],
+        }
+    ]
+
+
+def test_subscription_retry_same_inputs_returns_original(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+
+    first = _subscribe(client, "s1", "a", "  research  ", "2026-05-01T08:00:00+08:00")
+    assert first.status_code == 201
+    first_body = first.json()
+    assert first_body["subscription"]["use"] == "research"
+    assert first_body["subscription"]["at"] == "2026-05-01T00:00:00Z"
+
+    # Same id, trimmed use, same instant expressed in UTC -> replay, identical.
+    retry = _subscribe(client, "s1", "a", "research", "2026-05-01T00:00:00Z")
+    assert retry.status_code == 200
+    assert retry.json()["replayed"] is True
+    assert retry.json()["subscription"] == first_body["subscription"]
+
+    fetched = _get_subscription(client, "s1")
+    assert fetched.status_code == 200
+    assert fetched.json()["subscription_id"] == "s1"
+
+
+def test_subscription_same_id_different_inputs_conflict(client):
+    _register(client, "a")
+    _register(client, "b")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+    _change(client, "cb", "b", _iso(2026, 1, 1), ["research"])
+
+    assert _subscribe(client, "s1", "a", "research", _iso(2026, 5, 1)).status_code == 201
+
+    different_use = _subscribe(client, "s1", "a", "review", _iso(2026, 5, 1))
+    assert different_use.status_code == 409
+    assert different_use.json()["error"] == "conflict"
+
+    different_time = _subscribe(client, "s1", "a", "research", _iso(2026, 6, 1))
+    assert different_time.status_code == 409
+
+    different_version = _subscribe(client, "s1", "b", "research", _iso(2026, 5, 1))
+    assert different_version.status_code == 409
+
+    # The original subscription is untouched and still fetchable.
+    original = _get_subscription(client, "s1").json()
+    assert original["version_id"] == "a"
+    assert original["use"] == "research"
+    assert original["at"] == _iso(2026, 5, 1)
+
+
+def test_subscription_unknown_version_404_without_leaving_row(client):
+    resp = _subscribe(client, "s1", "ghost", "research", _iso(2026, 5, 1))
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "not_found"
+    assert _get_subscription(client, "s1").status_code == 404
+
+    # No half-finished row: the same id can still be used for a real version.
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+    second = _subscribe(client, "s1", "a", "research", _iso(2026, 5, 1))
+    assert second.status_code == 201
+    assert second.json()["replayed"] is False
+
+
+def test_subscription_invalid_inputs_are_422_without_row(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+
+    blank_use = _subscribe(client, "s1", "a", "   ", _iso(2026, 5, 1))
+    assert blank_use.status_code == 422
+    naive_at = _subscribe(client, "s2", "a", "research", "2026-05-01T00:00:00")
+    assert naive_at.status_code == 422
+
+    # Nothing was persisted; both ids are still unknown.
+    assert _get_subscription(client, "s1").status_code == 404
+    assert _get_subscription(client, "s2").status_code == 404
+
+
+def test_subscription_unknown_id_get_and_events_are_404(client):
+    resp = _get_subscription(client, "ghost")
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "not_found"
+    events = _events(client, "ghost")
+    assert events.status_code == 404
+    assert events.json()["error"] == "not_found"
+
+
+def test_subscription_without_id_is_generated(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+    resp = client.post(
+        "/permissions/subscriptions",
+        json={"version_id": "a", "use": "research", "at": _iso(2026, 5, 1)},
+    )
+    assert resp.status_code == 201
+    assert resp.json()["subscription"]["subscription_id"].startswith("s-")
+
+
+def test_change_flip_appends_event_and_keeps_baseline(client):
+    _register(client, "a")
+    # Baseline: no license at all -> denied with no_valid_license.
+    sub = _subscribe(client, "s1", "a", "research", _iso(2026, 5, 1)).json()["subscription"]
+    assert sub["baseline_allowed"] is False
+    assert sub["baseline_blockers"][0]["reason"] == "no_valid_license"
+
+    assert _change(client, "c1", "a", _iso(2026, 1, 1), ["research"]).status_code == 201
+
+    events = _events(client, "s1").json()
+    assert events["subscription_id"] == "s1"
+    assert events["next_cursor"] == 1
+    assert len(events["events"]) == 1
+    event = events["events"][0]
+    assert event["seq"] == 1
+    assert event["trigger_kind"] == "change"
+    assert event["trigger_id"] == "c1"
+    assert event["before_allowed"] is False
+    assert event["after_allowed"] is True
+    assert event["before_blockers"] == [
+        {
+            "version_id": "a",
+            "reason": "no_valid_license",
+            "change_id": None,
+            "effective_at": None,
+            "allowed_uses": [],
+        }
+    ]
+    assert event["after_blockers"] == []
+    assert event["registered_at"].startswith("20")
+
+    # The tracked state moved on; the frozen baseline did not.
+    current = _get_subscription(client, "s1").json()
+    assert current["baseline_allowed"] is False
+    assert current["current_allowed"] is True
+    assert current["current_blockers"] == []
+    assert current["last_event_seq"] == 1
+
+
+def test_change_without_flip_appends_no_event(client):
+    _register(client, "a")
+    _change(client, "c1", "a", _iso(2026, 1, 1), ["research"])
+    _subscribe(client, "s1", "a", "research", _iso(2026, 5, 1))
+
+    # Still allowed afterwards (widened uses): no flip, no event.
+    assert _change(client, "c2", "a", _iso(2026, 2, 1), ["research", "review"]).status_code == 201
+    # Effective after the pinned instant: cannot affect it.
+    assert _change(client, "c3", "a", _iso(2026, 6, 1), []).status_code == 201
+    # Unrelated version: not in the closure.
+    _register(client, "other")
+    assert _change(client, "c4", "other", _iso(2026, 1, 1), []).status_code == 201
+
+    events = _events(client, "s1").json()
+    assert events["events"] == []
+    assert events["next_cursor"] == 0
+    assert _get_subscription(client, "s1").json()["last_event_seq"] == 0
+
+
+def test_replayed_change_produces_no_duplicate_event(client):
+    _register(client, "a")
+    _subscribe(client, "s1", "a", "research", _iso(2026, 5, 1))
+    payload = {
+        "change_id": "c1",
+        "version_id": "a",
+        "effective_at": _iso(2026, 1, 1),
+        "allowed_uses": ["research"],
+    }
+    assert client.post("/license-changes", json=payload).status_code == 201
+    assert _events(client, "s1").json()["next_cursor"] == 1
+
+    # Same id + same content -> replay; the flip is not recorded twice.
+    replay = client.post("/license-changes", json=payload)
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
+    events = _events(client, "s1").json()
+    assert len(events["events"]) == 1
+    assert events["next_cursor"] == 1
+
+
+def test_revocation_flip_appends_event_and_replay_is_quiet(client):
+    _register(client, "a")
+    _change(client, "c1", "a", _iso(2026, 1, 1), ["research"])
+    _subscribe(client, "s1", "a", "research", _iso(2026, 5, 1))
+
+    assert _revoke(client, "c1", "rev-1", "登记有误").status_code == 201
+    events = _events(client, "s1").json()
+    assert len(events["events"]) == 1
+    event = events["events"][0]
+    assert event["seq"] == 1
+    assert event["trigger_kind"] == "revocation"
+    assert event["trigger_id"] == "rev-1"
+    assert event["before_allowed"] is True
+    assert event["after_allowed"] is False
+    assert event["before_blockers"] == []
+    assert event["after_blockers"] == [
+        {
+            "version_id": "a",
+            "reason": "no_valid_license",
+            "change_id": None,
+            "effective_at": None,
+            "allowed_uses": [],
+        }
+    ]
+
+    # Retrying the same revocation is a replay: no second event.
+    retry = _revoke(client, "c1", "rev-1", "登记有误")
+    assert retry.status_code == 200
+    assert _events(client, "s1").json()["next_cursor"] == 1
+
+
+def test_ancestor_change_flips_descendant_subscription(client):
+    _register(client, "root")
+    _change(client, "cr", "root", _iso(2026, 1, 1), ["research"])
+    _register(client, "leaf", ["root"])
+    _change(client, "cl", "leaf", _iso(2026, 1, 1), ["research"])
+    _subscribe(client, "s1", "leaf", "research", _iso(2026, 5, 1))
+
+    # Narrowing the root denies the descendant through the ancestor closure.
+    assert _change(client, "cr2", "root", _iso(2026, 3, 1), ["review"]).status_code == 201
+    events = _events(client, "s1").json()
+    assert len(events["events"]) == 1
+    event = events["events"][0]
+    assert event["after_allowed"] is False
+    assert event["after_blockers"] == [
+        {
+            "version_id": "root",
+            "reason": "use_not_allowed",
+            "change_id": "cr2",
+            "effective_at": _iso(2026, 3, 1),
+            "allowed_uses": ["review"],
+        }
+    ]
+
+
+def test_diamond_descendant_subscription_flips_once(client):
+    _register(client, "root")
+    _change(client, "cr", "root", _iso(2026, 1, 1), ["research"])
+    _register(client, "m1", ["root"])
+    _register(client, "m2", ["root"])
+    _change(client, "cm1", "m1", _iso(2026, 1, 1), ["research"])
+    _change(client, "cm2", "m2", _iso(2026, 1, 1), ["research"])
+    _register(client, "leaf", ["m1", "m2"])
+    _change(client, "cl", "leaf", _iso(2026, 1, 1), ["research"])
+    _subscribe(client, "s1", "leaf", "research", _iso(2026, 5, 1))
+
+    # One change on the shared root reaches the leaf via two paths; the
+    # diamond descendant is still evaluated (and recorded) exactly once.
+    assert _change(client, "cr2", "root", _iso(2026, 3, 1), []).status_code == 201
+    events = _events(client, "s1").json()
+    assert [e["seq"] for e in events["events"]] == [1]
+
+
+def test_change_on_descendant_does_not_affect_ancestor_subscription(client):
+    _register(client, "root")
+    _change(client, "cr", "root", _iso(2026, 1, 1), ["research"])
+    _register(client, "leaf", ["root"])
+    _subscribe(client, "s1", "root", "research", _iso(2026, 5, 1))
+
+    # The descendant is not part of the ancestor's closure.
+    assert _change(client, "cl", "leaf", _iso(2026, 2, 1), []).status_code == 201
+    assert _events(client, "s1").json()["events"] == []
+
+
+def test_multiple_subscriptions_each_record_their_own_flip(client):
+    _register(client, "a")
+    _subscribe(client, "s-research", "a", "research", _iso(2026, 5, 1))
+    _subscribe(client, "s-review", "a", "review", _iso(2026, 5, 1))
+
+    assert _change(client, "c1", "a", _iso(2026, 1, 1), ["research"]).status_code == 201
+
+    # research flips deny -> allow; review stays denied (blocker changed only).
+    research_events = _events(client, "s-research").json()
+    assert [e["seq"] for e in research_events["events"]] == [1]
+    assert research_events["events"][0]["trigger_id"] == "c1"
+    assert _events(client, "s-review").json()["events"] == []
+
+    # A later change covering both uses flips review exactly once, with its
+    # own per-subscription sequence starting at 1.
+    assert _change(client, "c2", "a", _iso(2026, 2, 1), ["research", "review"]).status_code == 201
+    review_events = _events(client, "s-review").json()
+    assert [e["seq"] for e in review_events["events"]] == [1]
+    assert review_events["events"][0]["trigger_id"] == "c2"
+    # research saw no flip from c2 (still allowed): still exactly one event.
+    assert _events(client, "s-research").json()["next_cursor"] == 1
+
+
+def test_events_cursor_pagination_is_stable(client):
+    _register(client, "a")
+    _subscribe(client, "s1", "a", "research", _iso(2026, 5, 1))
+    _change(client, "c1", "a", _iso(2026, 1, 1), ["research"])  # -> allow (seq 1)
+    _change(client, "c2", "a", _iso(2026, 2, 1), ["review"])  # -> deny (seq 2)
+    _revoke(client, "c2", "rev-c2", "撤回")  # -> allow again (seq 3)
+
+    first_page = _events(client, "s1", cursor=0, limit=2).json()
+    assert [e["seq"] for e in first_page["events"]] == [1, 2]
+    assert first_page["next_cursor"] == 2
+    assert [e["trigger_kind"] for e in first_page["events"]] == ["change", "change"]
+
+    second_page = _events(client, "s1", cursor=first_page["next_cursor"], limit=2).json()
+    assert [e["seq"] for e in second_page["events"]] == [3]
+    assert second_page["events"][0]["trigger_kind"] == "revocation"
+    assert second_page["events"][0]["trigger_id"] == "rev-c2"
+    assert second_page["next_cursor"] == 3
+
+    # No new events: the cursor does not advance and the order stays stable.
+    empty_page = _events(client, "s1", cursor=second_page["next_cursor"]).json()
+    assert empty_page["events"] == []
+    assert empty_page["next_cursor"] == 3
+
+    # Reading from 0 again returns the same persisted history verbatim.
+    assert _events(client, "s1").json()["events"] == (
+        first_page["events"] + second_page["events"]
+    )
+
+
+def test_events_invalid_cursor_is_422(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+    _subscribe(client, "s1", "a", "research", _iso(2026, 5, 1))
+    assert _events(client, "s1", cursor=-1).status_code == 422
+    assert _events(client, "s1", limit=0).status_code == 422
+
+
+def test_concurrent_identical_change_records_flip_exactly_once(client):
+    _register(client, "a")
+    _subscribe(client, "s1", "a", "research", _iso(2026, 5, 1))
+    service = client.app.state.app_state.service  # type: ignore[attr-defined]
+    outcomes: list[tuple[str, bool]] = []
+    lock = __import__("threading").Lock()
+
+    def worker() -> None:
+        try:
+            _, replayed = service.submit_change(
+                change_id="c1",
+                version_id="a",
+                effective_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                allowed_uses=["research"],
+            )
+            with lock:
+                outcomes.append(("ok", replayed))
+        except Exception as exc:  # noqa: BLE001
+            with lock:
+                outcomes.append((type(exc).__name__, False))
+
+    import threading
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(name == "ok" for name, _ in outcomes), outcomes
+    assert sum(1 for _, replayed in outcomes if not replayed) == 1
+    # Exactly one persisted event for the single flip, however many retries.
+    events = _events(client, "s1").json()
+    assert [e["seq"] for e in events["events"]] == [1]
+
+
+def test_concurrent_same_subscription_created_exactly_once(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+    service = client.app.state.app_state.service  # type: ignore[attr-defined]
+    outcomes: list[tuple[str, bool]] = []
+    lock = __import__("threading").Lock()
+
+    def worker() -> None:
+        try:
+            _, replayed = service.create_subscription(
+                subscription_id="s1",
+                version_id="a",
+                use="research",
+                at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+            )
+            with lock:
+                outcomes.append(("ok", replayed))
+        except Exception as exc:  # noqa: BLE001
+            with lock:
+                outcomes.append((type(exc).__name__, False))
+
+    import threading
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(name == "ok" for name, _ in outcomes), outcomes
+    assert sum(1 for _, replayed in outcomes if not replayed) == 1
+    assert _get_subscription(client, "s1").status_code == 200
+
+
+def test_subscription_on_demo_seed(tmp_path):
+    db_path = str(tmp_path / "seed-subscription.db")
+    settings = Settings(db_path=db_path, init_db=True, seed_demo=True, echo=False)
+    with TestClient(create_app(settings)) as test_client:
+        # review on demo-derived-1 is blocked by demo-root-b in March.
+        created = test_client.post(
+            "/permissions/subscriptions",
+            json={
+                "subscription_id": "demo-sub-1",
+                "version_id": "demo-derived-1",
+                "use": "review",
+                "at": "2026-03-01T00:00:00Z",
+            },
+        )
+        assert created.status_code == 201
+        sub = created.json()["subscription"]
+        assert sub["baseline_allowed"] is False
+        assert {b["version_id"] for b in sub["baseline_blockers"]} == {"demo-root-b"}
+
+        # Widening demo-root-b flips the watched decision to allowed.
+        change = test_client.post(
+            "/license-changes",
+            json={
+                "change_id": "demo-chg-b-2",
+                "version_id": "demo-root-b",
+                "effective_at": "2026-02-15T00:00:00Z",
+                "allowed_uses": ["research", "commercial", "review"],
+            },
+        )
+        assert change.status_code == 201
+
+        events = test_client.get("/permissions/subscriptions/demo-sub-1/events").json()
+        assert [e["seq"] for e in events["events"]] == [1]
+        event = events["events"][0]
+        assert event["trigger_kind"] == "change"
+        assert event["trigger_id"] == "demo-chg-b-2"
+        assert event["before_allowed"] is False
+        assert event["after_allowed"] is True
+        assert {b["version_id"] for b in event["before_blockers"]} == {"demo-root-b"}
+        assert event["after_blockers"] == []
+
+        current = test_client.get("/permissions/subscriptions/demo-sub-1").json()
+        assert current["baseline_allowed"] is False
+        assert current["current_allowed"] is True
+        assert current["last_event_seq"] == 1
