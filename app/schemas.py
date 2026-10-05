@@ -424,3 +424,89 @@ class ErrorDetail(BaseModel):
     error: str
     message: str
     details: dict[str, str | None] = Field(default_factory=dict)
+
+
+# -- permission result subscriptions --------------------------------------
+
+
+class SubscriptionCreateRequest(BaseModel):
+    subscription_id: str | None = Field(
+        default=None, min_length=1, max_length=128, description="唯一订阅标识；省略时自动生成 UUID"
+    )
+    version_id: str = Field(min_length=1, description="关注的已登记数据集版本")
+    use: str = Field(min_length=1, description="关注的用途（去首尾空格后判定与留痕）")
+    at: datetime = Field(description="带时区的固定判定时刻，服务统一换算为 UTC 归一化")
+
+    _check_time = field_validator("at")(_ensure_aware)
+
+    @field_validator("use")
+    @classmethod
+    def _use(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("use 不能为空白字符串")
+        return value
+
+
+class SubscriptionBaseline(BaseModel):
+    """建立订阅时原子固化的当时允许状态基线（含阻断原因）。"""
+
+    allowed: bool = Field(description="建立当时的允许状态（之后许可变化不改变基线）")
+    blockers: list[BlockerEntry] = Field(
+        default_factory=list, description="建立当时的全部阻断版本与原因（允许时为空）"
+    )
+
+
+class SubscriptionResponse(BaseModel):
+    subscription_id: str = Field(description="唯一订阅标识")
+    version_id: str
+    use: str = Field(description="去首尾空格后的关注用途")
+    at: datetime = Field(description="换算为 UTC 后的固定判定时刻")
+    created_at: datetime = Field(description="订阅建立时间（服务按 UTC 生成）")
+    baseline_allowed: bool = Field(description="建立当时原子固化的允许状态基线")
+    baseline_blockers: list[BlockerEntry] = Field(
+        default_factory=list, description="建立当时的全部阻断版本与原因（允许时为空）"
+    )
+
+
+class SubscriptionCreateResponse(BaseModel):
+    replayed: bool = Field(description="同标识与同输入重试时为 true，返回首次建立的原订阅")
+    subscription: SubscriptionResponse
+
+
+class SubscriptionEvent(BaseModel):
+    """一次允许状态翻转的持久事件：序号、触发操作、前后状态与阻断原因。"""
+
+    seq: int = Field(description="该订阅内从 1 起严格递增的事件序号")
+    trigger_kind: Literal["license_change", "revocation"] = Field(
+        description="触发本次翻转的操作类型：许可变更或作废"
+    )
+    trigger_id: str = Field(
+        description="触发操作的标识（变更标识或作废标识），可回溯到原操作"
+    )
+    change_id: str = Field(description="本次触发涉及的原许可变更标识")
+    effective_at: datetime | None = Field(
+        description="触发涉及变更的生效时刻（UTC；作废事件记录原变更的生效时刻）"
+    )
+    before_allowed: bool = Field(description="翻转前的允许状态")
+    after_allowed: bool = Field(description="翻转后的允许状态")
+    before_blockers: list[BlockerEntry] = Field(
+        default_factory=list, description="翻转前的全部阻断版本与原因"
+    )
+    after_blockers: list[BlockerEntry] = Field(
+        default_factory=list, description="翻转后的全部阻断版本与原因"
+    )
+    created_at: datetime = Field(description="事件追加时间（服务按 UTC 生成）")
+
+
+class SubscriptionEventPage(BaseModel):
+    subscription_id: str
+    after_seq: int = Field(description="本次读取所用的序号游标（严格大于该序号的事件才返回）")
+    limit: int = Field(description="本页最多返回的事件条数")
+    events: list[SubscriptionEvent] = Field(
+        description="按序号稳定升序排列的翻转事件页（无翻转时为空数组）"
+    )
+    next_cursor: int = Field(
+        description="下一游标（本页最后一条事件的序号；空页回显 after_seq）"
+    )
+    has_more: bool = Field(description="是否还有未读事件（用 next_cursor 继续翻页）")

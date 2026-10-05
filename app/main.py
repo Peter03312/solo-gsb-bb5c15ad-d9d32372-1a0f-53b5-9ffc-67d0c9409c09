@@ -35,6 +35,10 @@ from .schemas import (
     PublicKeyResponse,
     RevocationReceipt,
     RevocationResponse,
+    SubscriptionCreateRequest,
+    SubscriptionCreateResponse,
+    SubscriptionEventPage,
+    SubscriptionResponse,
     VersionCreateRequest,
     VersionResponse,
     VoucherDecision,
@@ -402,6 +406,73 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     def get_voucher(voucher_id: str, request: Request) -> VoucherDecision:
         return VoucherDecision(**service_from(request).get_voucher(voucher_id))
+
+    # -- permission result subscriptions (flip event streams) -------------
+
+    @app.post(
+        "/permissions/subscriptions",
+        response_model=SubscriptionCreateResponse,
+        status_code=201,
+        tags=["permissions"],
+        summary="关注许可结果：原子固化建立当时的允许状态基线（幂等）",
+        responses={
+            200: {"description": "同标识与同输入重试，返回首次建立的原订阅"},
+            201: {"description": "首次建立：判定与基线保存已原子完成，返回订阅"},
+            404: {"description": "版本不存在"},
+            409: {"description": "订阅标识复用到不同输入"},
+            422: {"description": "判定时刻缺少时区或无法解析，或用途为空白"},
+        },
+    )
+    def create_subscription(
+        payload: SubscriptionCreateRequest, request: Request
+    ) -> JSONResponse | SubscriptionCreateResponse:
+        subscription, replayed = service_from(request).create_subscription(
+            subscription_id=payload.subscription_id,
+            version_id=payload.version_id,
+            use=payload.use,
+            at=payload.at,
+        )
+        body = SubscriptionCreateResponse(
+            replayed=replayed, subscription=SubscriptionResponse(**subscription)
+        )
+        if replayed:
+            # 200 OK distinguishes an idempotent retry from first-time creation.
+            return JSONResponse(status_code=200, content=body.model_dump(mode="json"))
+        return body
+
+    @app.get(
+        "/permissions/subscriptions/{subscription_id}",
+        response_model=SubscriptionResponse,
+        tags=["permissions"],
+        summary="按订阅标识查询订阅与其不可变的允许状态基线",
+        responses={404: {"description": "订阅不存在"}},
+    )
+    def get_subscription(subscription_id: str, request: Request) -> SubscriptionResponse:
+        return SubscriptionResponse(
+            **service_from(request).get_subscription(subscription_id)
+        )
+
+    @app.get(
+        "/permissions/subscriptions/{subscription_id}/events",
+        response_model=SubscriptionEventPage,
+        tags=["permissions"],
+        summary="按订阅标识与序号游标读取允许状态翻转事件（稳定顺序）",
+        responses={404: {"description": "订阅不存在"}},
+    )
+    def read_subscription_events(
+        subscription_id: str,
+        request: Request,
+        after_seq: int = Query(
+            0, ge=0, description="序号游标：仅返回严格大于该序号的事件；0 表示从头读"
+        ),
+        limit: int = Query(
+            100, ge=1, le=1000, description="本页最多返回的事件条数（1–1000）"
+        ),
+    ) -> SubscriptionEventPage:
+        result = service_from(request).read_subscription_events(
+            subscription_id, after_seq, limit
+        )
+        return SubscriptionEventPage(**result)
 
     # -- signed voucher proof packages (offline audit) --------------------
 

@@ -1918,3 +1918,510 @@ def test_proof_on_demo_seed(tmp_path):
         }
         ok, message = verify_proof_package(pkg)
         assert ok, message
+
+
+# -- permission result subscriptions --------------------------------------
+
+
+def _subscribe(client, subscription_id, version_id, use, at):
+    return client.post(
+        "/permissions/subscriptions",
+        json={
+            "subscription_id": subscription_id,
+            "version_id": version_id,
+            "use": use,
+            "at": at,
+        },
+    )
+
+
+def _get_subscription(client, subscription_id):
+    return client.get(f"/permissions/subscriptions/{subscription_id}")
+
+
+def _events(client, subscription_id, after_seq=0, limit=100):
+    return client.get(
+        f"/permissions/subscriptions/{subscription_id}/events",
+        params={"after_seq": after_seq, "limit": limit},
+    )
+
+
+def _event_seqs(client, subscription_id):
+    body = _events(client, subscription_id).json()
+    return [e["seq"] for e in body["events"]]
+
+
+def test_subscription_baseline_freezes_current_decision(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+
+    # review is denied at creation: baseline freezes deny with the blocker.
+    resp = _subscribe(client, "sub-1", "v1", "research", _iso(2026, 5, 1))
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["replayed"] is False
+    sub = body["subscription"]
+    assert sub["subscription_id"] == "sub-1"
+    assert sub["version_id"] == "v1"
+    assert sub["use"] == "research"
+    assert sub["at"] == "2026-05-01T00:00:00Z"
+    assert sub["baseline_allowed"] is True
+    assert sub["baseline_blockers"] == []
+
+    denied = _subscribe(client, "sub-2", "v1", " review ", _iso(2026, 5, 1)).json()[
+        "subscription"
+    ]
+    assert denied["use"] == "review"
+    assert denied["baseline_allowed"] is False
+    assert denied["baseline_blockers"] == [
+        {
+            "version_id": "v1",
+            "reason": "use_not_allowed",
+            "change_id": "c1",
+            "effective_at": "2026-01-01T00:00:00Z",
+            "allowed_uses": ["research"],
+        }
+    ]
+
+    # GET returns the same immutable baseline.
+    assert _get_subscription(client, "sub-2").json() == denied
+
+
+def test_subscription_retry_same_inputs_returns_original(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    first = _subscribe(client, "sub-1", "v1", " research ", _iso(2026, 3, 1, 8))
+    assert first.status_code == 201
+    first_body = first.json()
+
+    # Same UTC instant expressed in Z, trimmed use -> 200 replay, byte-equal.
+    retry = _subscribe(
+        client, "sub-1", "v1", "research", "2026-03-01T08:00:00Z"
+    )
+    assert retry.status_code == 200
+    assert retry.json()["replayed"] is True
+    assert retry.json()["subscription"] == first_body["subscription"]
+
+    # A flip happens in between: a retry must still return the ORIGINAL baseline.
+    later = _change(client, "c2", "v1", _iso(2026, 2, 1), ["research", "review"])
+    assert later.status_code == 201
+    again = _subscribe(client, "sub-1", "v1", "research", _iso(2026, 3, 1, 8))
+    assert again.status_code == 200
+    assert again.json()["subscription"]["created_at"] == first_body["subscription"][
+        "created_at"
+    ]
+
+
+def test_subscription_same_id_different_inputs_conflict(client):
+    _register(client, "v1")
+    _register(client, "v2")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    _subscribe(client, "sub-1", "v1", "research", _iso(2026, 5, 1))
+
+    other_use = _subscribe(client, "sub-1", "v1", "review", _iso(2026, 5, 1))
+    assert other_use.status_code == 409
+    other_version = _subscribe(client, "sub-1", "v2", "research", _iso(2026, 5, 1))
+    assert other_version.status_code == 409
+    other_at = _subscribe(client, "sub-1", "v1", "research", _iso(2026, 6, 1))
+    assert other_at.status_code == 409
+
+    # Original subscription stays untouched.
+    got = _get_subscription(client, "sub-1").json()
+    assert got["version_id"] == "v1" and got["use"] == "research"
+
+
+def test_subscription_invalid_inputs_error_without_row(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+
+    unknown = _subscribe(client, "sub-x", "no-such-version", "research", _iso(2026, 5, 1))
+    assert unknown.status_code == 404
+    assert _get_subscription(client, "sub-x").status_code == 404
+    assert _events(client, "sub-x").status_code == 404
+
+    naive = _subscribe(
+        client, "sub-y", "v1", "research", "2026-05-01T00:00:00"
+    )
+    assert naive.status_code == 422
+    assert _get_subscription(client, "sub-y").status_code == 404
+
+    blank_use = _subscribe(client, "sub-z", "v1", "   ", _iso(2026, 5, 1))
+    assert blank_use.status_code == 422
+    assert _get_subscription(client, "sub-z").status_code == 404
+
+
+def test_subscription_without_id_is_generated(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    resp = client.post(
+        "/permissions/subscriptions",
+        json={"version_id": "v1", "use": "research", "at": _iso(2026, 5, 1)},
+    )
+    assert resp.status_code == 201
+    assert resp.json()["subscription"]["subscription_id"].startswith("s-")
+
+
+def test_flip_events_append_on_change_and_revoke_chain(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    sub = _subscribe(client, "sub-1", "v1", "review", _iso(2026, 9, 1)).json()[
+        "subscription"
+    ]
+    assert sub["baseline_allowed"] is False
+
+    # c2 opens review: deny -> allow.
+    assert _change(client, "c2", "v1", _iso(2026, 3, 1), ["research", "review"]).status_code == 201
+    # c3 closes it again: allow -> deny.
+    assert _change(client, "c3", "v1", _iso(2026, 6, 1), ["research"]).status_code == 201
+    # Revoking c3 re-exposes c2: deny -> allow.
+    assert _revoke(client, "c3", "rev-c3", "撤回收紧").status_code == 201
+    # Revoking c2 re-exposes c1 (research only): allow -> deny.
+    assert _revoke(client, "c2", "rev-c2", "撤回放开").status_code == 201
+
+    page = _events(client, "sub-1").json()
+    assert page["next_cursor"] == 4 and page["has_more"] is False
+    events = page["events"]
+    assert [e["seq"] for e in events] == [1, 2, 3, 4]
+
+    assert events[0]["trigger_kind"] == "license_change"
+    assert events[0]["trigger_id"] == "c2"
+    assert events[0]["change_id"] == "c2"
+    assert events[0]["effective_at"] == "2026-03-01T00:00:00Z"
+    assert events[0]["before_allowed"] is False
+    assert events[0]["after_allowed"] is True
+    assert events[0]["before_blockers"][0]["reason"] == "use_not_allowed"
+    assert events[0]["after_blockers"] == []
+
+    assert events[1]["trigger_id"] == "c3"
+    assert events[1]["before_allowed"] is True
+    assert events[1]["after_allowed"] is False
+    assert events[1]["after_blockers"][0]["change_id"] == "c3"
+
+    assert events[2]["trigger_kind"] == "revocation"
+    assert events[2]["trigger_id"] == "rev-c3"
+    assert events[2]["change_id"] == "c3"
+    assert events[2]["effective_at"] == "2026-06-01T00:00:00Z"
+    assert events[2]["before_allowed"] is False
+    assert events[2]["after_allowed"] is True
+
+    assert events[3]["trigger_kind"] == "revocation"
+    assert events[3]["trigger_id"] == "rev-c2"
+    assert events[3]["change_id"] == "c2"
+    assert events[3]["before_allowed"] is True
+    assert events[3]["after_allowed"] is False
+    # c1 is now the latest effective change again.
+    assert events[3]["after_blockers"][0]["change_id"] == "c1"
+
+    # Retrying a committed change never produces a duplicate event.
+    replay = _change(
+        client, "c2", "v1", _iso(2026, 3, 1), ["review", "research"]
+    )
+    assert replay.status_code == 200 and replay.json()["replayed"] is True
+    assert _event_seqs(client, "sub-1") == [1, 2, 3, 4]
+    # Replaying a revocation likewise appends nothing.
+    rev_replay = _revoke(client, "c3", "rev-c3", "撤回收紧")
+    assert rev_replay.status_code == 200
+    assert _event_seqs(client, "sub-1") == [1, 2, 3, 4]
+
+
+def test_non_flipping_change_appends_no_event(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    _subscribe(client, "sub-1", "v1", "research", _iso(2026, 9, 1))
+
+    # Adding review does not flip research (still allowed): no event.
+    assert _change(client, "c2", "v1", _iso(2026, 3, 1), ["research", "review"]).status_code == 201
+    assert _events(client, "sub-1").json()["events"] == []
+
+
+def test_future_effective_change_does_not_flip_past_subscription(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    # Fixed decision instant is February; nothing effective then allows review.
+    _subscribe(client, "sub-1", "v1", "review", _iso(2026, 2, 1))
+
+    assert _change(client, "c2", "v1", _iso(2026, 3, 1), ["research", "review"]).status_code == 201
+    assert _events(client, "sub-1").json()["events"] == []
+
+    # A subscription created later at a May instant starts from the new state,
+    # with no backfilled history.
+    later = _subscribe(client, "sub-2", "v1", "review", _iso(2026, 5, 1)).json()[
+        "subscription"
+    ]
+    assert later["baseline_allowed"] is True
+    assert _events(client, "sub-2").json()["events"] == []
+
+
+def test_change_flips_descendant_subscriptions_only(client):
+    _register(client, "root")
+    _register(client, "other-root")
+    _register(client, "child", parents=["root"])
+    # Diamond: grandchild reaches root both directly and via child (counted once).
+    _register(client, "grandchild", parents=["child", "root"])
+    # Grandchild's own January change already includes review: its review status
+    # is then controlled solely by the root/child intersection.
+    _change(client, "c-root", "root", _iso(2026, 1, 1), ["research"])
+    _change(client, "c-other-root", "other-root", _iso(2026, 1, 1), ["research"])
+    _change(client, "c-child", "child", _iso(2026, 1, 1), ["research"])
+    _change(
+        client,
+        "c-grandchild",
+        "grandchild",
+        _iso(2026, 1, 1),
+        ["research", "review"],
+    )
+
+    for sid, vid in [
+        ("s-root", "root"),
+        ("s-child", "child"),
+        ("s-grand", "grandchild"),
+        ("s-other", "other-root"),
+    ]:
+        _subscribe(client, sid, vid, "review", _iso(2026, 9, 1))
+
+    # Relaxing root flips root; child/grandchild still deny on child's change.
+    assert _change(
+        client, "c-root-2", "root", _iso(2026, 3, 1), ["research", "review"]
+    ).status_code == 201
+    assert _event_seqs(client, "s-root") == [1]
+    assert _events(client, "s-child").json()["events"] == []
+    assert _events(client, "s-grand").json()["events"] == []
+    assert _events(client, "s-other").json()["events"] == []
+
+    # Relaxing the child then flips child and grandchild (root counted once).
+    assert _change(
+        client, "c-child-2", "child", _iso(2026, 4, 1), ["research", "review"]
+    ).status_code == 201
+    assert _event_seqs(client, "s-child") == [1]
+    assert _event_seqs(client, "s-grand") == [1]
+    assert _events(client, "s-other").json()["events"] == []
+
+    # Revoking child's change flips child and grandchild back exactly once.
+    assert _revoke(client, "c-child-2", "rev-child", "x").status_code == 201
+    assert [e["seq"] for e in _events(client, "s-child").json()["events"]] == [1, 2]
+    assert [e["seq"] for e in _events(client, "s-grand").json()["events"]] == [1, 2]
+
+
+def test_subscription_event_paging_is_stable(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    _subscribe(client, "sub-1", "v1", "review", _iso(2026, 12, 1))
+    _change(client, "c2", "v1", _iso(2026, 2, 1), ["research", "review"])
+    _change(client, "c3", "v1", _iso(2026, 3, 1), ["research"])
+    _revoke(client, "c3", "rev-c3", "x")
+    assert _event_seqs(client, "sub-1") == [1, 2, 3]
+
+    first = _events(client, "sub-1", after_seq=0, limit=1).json()
+    assert [e["seq"] for e in first["events"]] == [1]
+    assert first["next_cursor"] == 1 and first["has_more"] is True
+
+    second = _events(client, "sub-1", after_seq=1, limit=1).json()
+    assert [e["seq"] for e in second["events"]] == [2]
+    assert second["next_cursor"] == 2 and second["has_more"] is True
+
+    third = _events(client, "sub-1", after_seq=2, limit=1).json()
+    assert [e["seq"] for e in third["events"]] == [3]
+    assert third["next_cursor"] == 3 and third["has_more"] is False
+
+    tail = _events(client, "sub-1", after_seq=3, limit=10).json()
+    assert tail["events"] == []
+    assert tail["next_cursor"] == 3 and tail["has_more"] is False
+
+    # Larger page walks the same stable order in one go.
+    full = _events(client, "sub-1", after_seq=0, limit=10).json()
+    assert [e["seq"] for e in full["events"]] == [1, 2, 3]
+    assert full["has_more"] is False
+
+    # Invalid cursor / page size are rejected.
+    assert client.get(
+        "/permissions/subscriptions/sub-1/events", params={"after_seq": -1}
+    ).status_code == 422
+    assert client.get(
+        "/permissions/subscriptions/sub-1/events", params={"limit": 0}
+    ).status_code == 422
+
+
+def test_distinct_subscriptions_same_watched_decision_both_flip(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    _subscribe(client, "sub-a", "v1", "review", _iso(2026, 9, 1))
+    _subscribe(client, "sub-b", "v1", "review", _iso(2026, 9, 1))
+    assert _change(
+        client, "c2", "v1", _iso(2026, 3, 1), ["research", "review"]
+    ).status_code == 201
+    assert _event_seqs(client, "sub-a") == [1]
+    assert _event_seqs(client, "sub-b") == [1]
+
+
+def test_concurrent_subscriptions_versus_change_flip_once_each(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    service = client.app.state.app_state.service  # type: ignore[attr-defined]
+    import threading
+
+    outcomes: list[str] = []
+    lock = threading.Lock()
+
+    def subscribe(idx: int) -> None:
+        try:
+            sub, _ = service.create_subscription(
+                subscription_id=f"sub-{idx}",
+                version_id="v1",
+                use="review",
+                at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+            )
+            with lock:
+                outcomes.append(f"created-{sub['baseline_allowed']}")
+        except Exception as exc:  # noqa: BLE001
+            with lock:
+                outcomes.append(f"error-{type(exc).__name__}")
+
+    def flip_change() -> None:
+        service.submit_change(
+            change_id="c2",
+            version_id="v1",
+            effective_at=datetime(2026, 3, 1, tzinfo=timezone.utc),
+            allowed_uses=["research", "review"],
+        )
+
+    threads = [threading.Thread(target=subscribe, args=(i,)) for i in range(8)]
+    threads.append(threading.Thread(target=flip_change))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(not o.startswith("error") for o in outcomes), outcomes
+    # Each subscription is internally consistent: either it saw the final state
+    # in its baseline (no events) or it froze the old deny baseline and got
+    # exactly one flip event — never duplicated, never missed.
+    state_from_event = {True: 0, False: 0}
+    for idx in range(8):
+        sid = f"sub-{idx}"
+        sub = _get_subscription(client, sid).json()
+        events = _events(client, sid).json()["events"]
+        if sub["baseline_allowed"] is True:
+            assert events == []
+            state_from_event[True] += 1
+        else:
+            assert [e["seq"] for e in events] == [1]
+            assert events[0]["after_allowed"] is True
+            state_from_event[False] += 1
+    assert state_from_event[True] + state_from_event[False] == 8
+
+
+def test_concurrent_same_subscription_id_creates_once(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    service = client.app.state.app_state.service  # type: ignore[attr-defined]
+    import threading
+
+    codes: list[int] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        try:
+            _, replayed = service.create_subscription(
+                subscription_id="sub-1",
+                version_id="v1",
+                use="research",
+                at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+            )
+            with lock:
+                codes.append(200 if replayed else 201)
+        except Exception as exc:  # noqa: BLE001
+            with lock:
+                codes.append(getattr(exc, "status_code", 0))
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert codes.count(201) == 1
+    assert sorted(codes).count(200) == 7
+
+
+def test_concurrent_revocations_flip_exactly_once(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    _subscribe(client, "sub-1", "v1", "review", _iso(2026, 9, 1))
+    assert _change(
+        client, "c2", "v1", _iso(2026, 3, 1), ["research", "review"]
+    ).status_code == 201
+    assert _event_seqs(client, "sub-1") == [1]
+
+    service = client.app.state.app_state.service  # type: ignore[attr-defined]
+    import threading
+
+    results: list[tuple[str, int]] = []
+    lock = threading.Lock()
+
+    def revoke(idx: int) -> None:
+        try:
+            _, replayed = service.revoke_change(
+                change_id="c2",
+                revocation_id=f"rev-{idx}",
+                reason="并发作废",
+            )
+            with lock:
+                results.append(("ok", 200 if replayed else 201))
+        except Exception as exc:  # noqa: BLE001
+            with lock:
+                results.append(("conflict", getattr(exc, "status_code", 0)))
+
+    threads = [threading.Thread(target=revoke, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sum(1 for kind, code in results if kind == "ok" and code == 201) == 1
+    assert all(
+        code == 409 for kind, code in results if kind == "conflict"
+    ), results
+    # The one successful revocation appended exactly one flip (seq 2).
+    assert _event_seqs(client, "sub-1") == [1, 2]
+    events = _events(client, "sub-1").json()["events"]
+    assert events[1]["trigger_kind"] == "revocation"
+    assert events[1]["after_allowed"] is False
+
+
+def test_subscription_on_demo_seed(tmp_path):
+    db_path = str(tmp_path / "seed-sub.db")
+    settings = Settings(db_path=db_path, init_db=True, seed_demo=True, echo=False)
+    with TestClient(create_app(settings)) as test_client:
+        # review is blocked by root-b on demo-derived-1 in March.
+        resp = test_client.post(
+            "/permissions/subscriptions",
+            json={
+                "subscription_id": "demo-sub-1",
+                "version_id": "demo-derived-1",
+                "use": "review",
+                "at": "2026-03-01T08:00:00+08:00",
+            },
+        )
+        assert resp.status_code == 201
+        sub = resp.json()["subscription"]
+        assert sub["at"] == "2026-03-01T00:00:00Z"
+        assert sub["baseline_allowed"] is False
+        assert any(
+            bl["version_id"] == "demo-root-b" and bl["reason"] == "use_not_allowed"
+            for bl in sub["baseline_blockers"]
+        )
+
+        retry = test_client.post(
+            "/permissions/subscriptions",
+            json={
+                "subscription_id": "demo-sub-1",
+                "version_id": "demo-derived-1",
+                "use": " review ",
+                "at": "2026-03-01T00:00:00Z",
+            },
+        )
+        assert retry.status_code == 200
+        assert retry.json()["subscription"] == sub
+        assert test_client.get(
+            "/permissions/subscriptions/demo-sub-1/events"
+        ).json()["events"] == []

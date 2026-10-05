@@ -131,6 +131,67 @@ curl -s "$BASE/permissions/check?version_id=demo-derived-1&use=research&at=2026-
 echo "# 而凭证恒为首次保存的 allowed=true："
 curl -s "$BASE/permissions/vouchers/example-voucher-2"; echo
 
+say "许可结果订阅：自包含示例版本 sub-demo-v1 先登记并提交 2026-03 起仅 research"
+curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' \
+  -d '{"version_id":"sub-demo-v1","parent_ids":[],"note":"许可结果订阅调用示例"}' >/dev/null || true
+curl -s -X POST "$BASE/license-changes" -H 'Content-Type: application/json' \
+  -d '{"change_id":"sub-demo-c1","version_id":"sub-demo-v1","effective_at":"2026-03-01T00:00:00Z","allowed_uses":["research"]}' >/dev/null || true
+
+say "建立订阅：关注 sub-demo-v1 在固定时刻 2026-09-01 对 review 的许可（基线为拒绝），201"
+curl -s -X POST "$BASE/permissions/subscriptions" -H 'Content-Type: application/json' \
+  -d '{"subscription_id":"example-sub-1","version_id":"sub-demo-v1","use":" review ","at":"2026-09-01T08:00:00+08:00"}'; echo
+
+say "订阅重试：去空格用途 + 同一 UTC 瞬间（+08:00 与 Z 等价）-> 200 replayed=true，原订阅逐字段一致"
+curl -s -X POST "$BASE/permissions/subscriptions" -H 'Content-Type: application/json' \
+  -d '{"subscription_id":"example-sub-1","version_id":"sub-demo-v1","use":"review","at":"2026-09-01T00:00:00Z"}'; echo
+
+say "订阅追溯：按订阅标识取回不可变基线"
+curl -s "$BASE/permissions/subscriptions/example-sub-1"; echo
+
+say "触发翻转 1：2026-06 起放开 review（拒绝 -> 允许），变更与事件同一事务落库"
+curl -s -X POST "$BASE/license-changes" -H 'Content-Type: application/json' \
+  -d '{"change_id":"sub-demo-c2","version_id":"sub-demo-v1","effective_at":"2026-06-01T00:00:00Z","allowed_uses":["research","review"]}'; echo
+
+say "触发翻转 2：再收紧回仅 research（允许 -> 拒绝）"
+curl -s -X POST "$BASE/license-changes" -H 'Content-Type: application/json' \
+  -d '{"change_id":"sub-demo-c3","version_id":"sub-demo-v1","effective_at":"2026-07-01T00:00:00Z","allowed_uses":["research"]}'; echo
+
+say "触发翻转 3：作废 sub-demo-c3（拒绝 -> 允许；作废与事件同一事务）"
+curl -s -X POST "$BASE/license-changes/revocations" -H 'Content-Type: application/json' \
+  -d '{"change_id":"sub-demo-c3","revocation_id":"sub-demo-rev-c3","reason":"收紧登记有误，撤回"}'; echo
+
+say "变更/作废重试不产生重复事件（返回 200 replayed=true，事件数不变）"
+curl -s -X POST "$BASE/license-changes" -H 'Content-Type: application/json' \
+  -d '{"change_id":"sub-demo-c2","version_id":"sub-demo-v1","effective_at":"2026-06-01T00:00:00Z","allowed_uses":["review","research"]}'; echo
+curl -s -X POST "$BASE/license-changes/revocations" -H 'Content-Type: application/json' \
+  -d '{"change_id":"sub-demo-c3","revocation_id":"sub-demo-rev-c3","reason":"收紧登记有误，撤回"}'; echo
+
+say "读取翻转事件：按序号游标从头读（稳定升序、逐序号递增）"
+curl -s "$BASE/permissions/subscriptions/example-sub-1/events?after_seq=0&limit=2"; echo
+
+say "游标翻页：带上一页 next_cursor=2 继续读"
+curl -s "$BASE/permissions/subscriptions/example-sub-1/events?after_seq=2&limit=10"; echo
+
+say "订阅冲突：同一标识换用途 -> 409（原订阅不变）"
+curl -s -X POST "$BASE/permissions/subscriptions" -H 'Content-Type: application/json' \
+  -d '{"subscription_id":"example-sub-1","version_id":"sub-demo-v1","use":"commercial","at":"2026-09-01T00:00:00Z"}'; echo
+
+say "订阅错误 1：未知版本 -> 404，不留订阅"
+curl -s -X POST "$BASE/permissions/subscriptions" -H 'Content-Type: application/json' \
+  -d '{"subscription_id":"example-sub-x","version_id":"no-such-version","use":"research","at":"2026-09-01T00:00:00Z"}'; echo
+
+say "订阅错误 2：无时区时刻 -> 422，不留订阅"
+curl -s -X POST "$BASE/permissions/subscriptions" -H 'Content-Type: application/json' \
+  -d '{"subscription_id":"example-sub-x","version_id":"sub-demo-v1","use":"research","at":"2026-09-01T00:00:00"}'; echo
+
+say "订阅错误 3：空用途 -> 422，不留订阅"
+curl -s -X POST "$BASE/permissions/subscriptions" -H 'Content-Type:application/json' \
+  -d '{"subscription_id":"example-sub-x","version_id":"sub-demo-v1","use":"   ","at":"2026-09-01T00:00:00Z"}'; echo
+
+say "订阅错误 4：未知订阅标识（GET/事件流）-> 404"
+curl -s "$BASE/permissions/subscriptions/no-such-subscription"; echo
+curl -s "$BASE/permissions/subscriptions/no-such-subscription/events"; echo
+
 say "证明包：首次导出 example-voucher-1 -> 201（签名并原子固化）"
 curl -s -X POST "$BASE/permissions/vouchers/example-voucher-1/proof"; echo
 

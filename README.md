@@ -23,7 +23,11 @@
 - **用途判定凭证（可追溯）**：研究审批可把一次用途判定**固化为凭证**（`POST /permissions/vouchers`）。请求携带**唯一凭证标识、已登记版本、用途、带时区的判定时刻**；首次请求在**同一一致数据视图**中沿用现有判定规则，把服务按 UTC 生成的**登记时间**连同**完整祖先闭包、依据（basis）、阻断原因（blockers）与用途交集**一次性持久保存——**允许与拒绝都留痕**。判定与保存在**单个写事务内原子完成，失败不留半成品**。
   - 凭证是**不可变历史**：`GET /permissions/vouchers/{voucher_id}` 始终返回**首次保存**的结果；之后的许可变更或作废只影响实时判定与预演，**不能改写历史凭证**。
   - **幂等与冲突**：相同凭证标识、相同版本、**去首尾空格后相同的用途**、**换算为 UTC 后相同的判定时刻**重试 → `200` 且 `replayed=true`，返回原凭证；同一标识复用到不同输入（版本/用途/时刻任一不同）→ `409 conflict`；未知凭证 → `404 not_found`；未知版本 → `404`；空用途或无时区时刻 → `422`，且**均不留凭证**。
-- **离线审计证明包（签名固定）**：已签发凭证可按标识导出自包含证明包（`POST /permissions/vouchers/{id}/proof`），内含**首次判定完整快照、签名算法（Ed25519/JWS EdDSA）、密钥标识、签名与明确验签编码规则**；签名覆盖版本、用途、判定时刻、登记时刻、祖先、依据、阻断原因与用途交集（顺序敏感），**篡改任一字段均无法通过验签**。首次导出**原子固化**，重复或并发导出返回同一内容；历史凭证同样可导出，未知凭证明确报错。签名密钥为**本地持久密钥**（`SIGNING_KEYS_DIR`），**轮换活跃密钥后旧证明包与旧公钥仍可核验、旧包绝不重签**，密钥不可用时明确报 `503`。详见下文第 8–10 节。
+- **许可结果订阅与翻转事件流**：研究团队可对某已登记版本的「用途 + 带时区的固定判定时刻」建立订阅（`POST /permissions/subscriptions`），携带**唯一订阅标识**。建立订阅时在**单个 `BEGIN IMMEDIATE` 写事务**内沿用现有判定规则，把**当时的允许状态原子保存为不可变基线**（`baseline_allowed` 与全部阻断版本/原因，允许与拒绝都固化）。此后每当**真实提交许可变更或作废**，服务在**同一事务**内按现有「祖先闭包、不晚于时刻的最近有效变更、作废忽略」规则**重新判定受影响订阅**（目标版本自身及其全部后代；菱形后代只计一次）：**仅当允许状态真正翻转**时才追加一条持久事件，事件记录**订阅内从 1 起递增的序号、触发操作类型与标识（变更/作废）、关联变更与生效时刻、前后允许状态与前后阻断原因**；状态未翻转（变更晚于固定时刻、被更晚变更覆盖、仅依据变化而允许状态不变）一律不追加。
+  - **按订阅标识 + 序号游标读取事件**（`GET /permissions/subscriptions/{id}/events?after_seq=&limit=`）：严格按序号升序稳定返回，`next_cursor` 给出下一游标（空页回显当前游标），`has_more` 提示是否还有后续；可从任意已见游标续读，顺序不重不漏。
+  - **幂等与并发**：变更/作废的同标识重试返回原记录，**绝不产生重复事件**；订阅与变更/作废并发时，进程级锁 + 单写事务 + 每订阅 `(subscription_id, seq)` 唯一约束共同保证「翻转与触发同进同退」，一次翻转**既不漏计也不重复计入**。
+  - 基线不可变：订阅后许可如何变化，`GET /permissions/subscriptions/{id}` 与同输入重试都恒返回建立时的基线；事件流才是之后翻转的留痕。**幂等/冲突/错误口径与凭证一致**：同标识 + 同版本 + 去空格用途 + UTC 归一化同时刻重试返回原订阅（`200 replayed=true`）；标识复用到不同输入 → `409`；未知订阅 → `404`；未知版本 → `404`；空用途或无时区时刻 → `422`，且**均不留新订阅**。
+- **离线审计证明包（签名固定）**：已签发凭证可按标识导出自包含证明包（`POST /permissions/vouchers/{id}/proof`），内含**首次判定完整快照、签名算法（Ed25519/JWS EdDSA）、密钥标识、签名与明确验签编码规则**；签名覆盖版本、用途、判定时刻、登记时刻、祖先、依据、阻断原因与用途交集（顺序敏感），**篡改任一字段均无法通过验签**。首次导出**原子固化**，重复或并发导出返回同一内容；历史凭证同样可导出，未知凭证明确报错。签名密钥为**本地持久密钥**（`SIGNING_KEYS_DIR`），**轮换活跃密钥后旧证明包与旧公钥仍可核验、旧包绝不重签**，密钥不可用时明确报 `503`。详见下文第 9–11 节。
 - **幂等与冲突**：
   - 相同**变更标识**且语义内容（版本、生效时刻、允许用途集合；用途顺序/重复不影响）完全相同的重复提交，返回**同一结果**（HTTP `200`，`replayed=true`）；
   - 标识相同而内容不同 → `409 conflict`；
@@ -37,7 +41,7 @@
 .
 ├── app/
 │   ├── main.py        # FastAPI 路由与异常映射
-│   ├── service.py     # 核心业务逻辑（登记 / 变更 / 判定 / 凭证 / 证明包导出 / 幂等冲突）
+│   ├── service.py     # 核心业务逻辑（登记 / 变更 / 判定 / 凭证 / 订阅与翻转事件流 / 证明包导出 / 幂等冲突）
 │   ├── signing.py     # 本地持久 Ed25519 密钥、密钥轮换与 JWS(EdDSA) 证明包签名/验签
 │   ├── database.py    # SQLite 连接与建表
 │   ├── schemas.py     # 请求/响应模型
@@ -412,7 +416,133 @@ curl -s -X POST http://localhost:8000/permissions/vouchers \
   -d '{"voucher_id":"approval-2026-03-research-001","version_id":"demo-derived-1","use":"commercial","at":"2026-03-01T00:00:00Z"}'
 ```
 
-### 8. 导出用途判定凭证的离线审计证明包（签名固定）
+### 8. 许可结果订阅与翻转事件流（基线原子固化，翻转同事务留痕）
+
+`POST /permissions/subscriptions` · `GET /permissions/subscriptions/{subscription_id}` · `GET /permissions/subscriptions/{subscription_id}/events`
+
+研究团队可对某个**已登记版本**的「**用途 + 带时区的固定判定时刻**」建立长期关注。首次请求在**单个 `BEGIN IMMEDIATE` 写事务**内、以同一一致快照完成「版本校验 → 祖先展开 → 沿用现有判定规则评估 → 固化基线」，把**建立当时的允许状态**（`baseline_allowed` 与全部阻断版本/原因，允许与拒绝都留痕）原子保存；任一步失败全部回滚，**不留半成品订阅**。此后真实的许可变更/作废在各自的**同一事务**内重新判定受影响订阅，只对**允许状态真正翻转**的订阅追加事件。
+
+```bash
+# 建立订阅（示例版本 sub-demo-v1 在 2026-09 仅允许 research，关注 review -> 基线拒绝）
+curl -s -X POST http://localhost:8000/permissions/subscriptions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "subscription_id": "approval-watch-review-2026-09",
+    "version_id": "sub-demo-v1",
+    "use": " review ",
+    "at": "2026-09-01T08:00:00+08:00"
+  }'
+```
+
+首次建立返回 `201`（`replayed=false`）；用途与时刻在服务侧归一化（去首尾空格、换算 UTC）：
+
+```json
+{
+  "replayed": false,
+  "subscription": {
+    "subscription_id": "approval-watch-review-2026-09",
+    "version_id": "sub-demo-v1",
+    "use": "review",
+    "at": "2026-09-01T00:00:00Z",
+    "created_at": "2026-10-05T10:00:00.000000Z",
+    "baseline_allowed": false,
+    "baseline_blockers": [
+      {
+        "version_id": "sub-demo-v1",
+        "reason": "use_not_allowed",
+        "change_id": "sub-demo-c1",
+        "effective_at": "2026-03-01T00:00:00Z",
+        "allowed_uses": ["research"]
+      }
+    ]
+  }
+}
+```
+
+**翻转事件如何产生**：此后每条真实变更/作废提交后，服务沿固定父引用取**目标版本自身及全部后代**（菱形去重），用**现有规则**（各版本不晚于固定时刻的最近**未作废**变更、用途交集、无有效许可即 `no_valid_license` 阻断）在触发操作的**同一写事务**内重新判定每个候选订阅；**仅当允许状态与上一状态不同**才追加事件，记录：
+
+- `seq`：**该订阅内从 1 起严格递增**的事件序号；
+- `trigger_kind` / `trigger_id`：触发操作类型（`license_change` 变更 / `revocation` 作废）与对应标识（`change_id` / `revocation_id`）；
+- `change_id` / `effective_at`：本次涉及的原许可变更与其生效时刻（作废事件记录原变更的生效时刻，作废对所有时刻生效）；
+- `before_allowed` / `after_allowed`：翻转前后允许状态；
+- `before_blockers` / `after_blockers`：翻转前后的**全部阻断版本与原因**（字段口径同判定接口；允许时为空数组）；
+- `created_at`：事件追加时间（UTC，服务生成）。
+
+```bash
+# 6 月起放开 review -> 为订阅追加 seq=1（false -> true）
+curl -s -X POST http://localhost:8000/license-changes -H 'Content-Type: application/json' \
+  -d '{"change_id":"sub-demo-c2","version_id":"sub-demo-v1","effective_at":"2026-06-01T00:00:00Z","allowed_uses":["research","review"]}'
+
+# 7 月再收紧回 research -> seq=2（true -> false）
+curl -s -X POST http://localhost:8000/license-changes -H 'Content-Type: application/json' \
+  -d '{"change_id":"sub-demo-c3","version_id":"sub-demo-v1","effective_at":"2026-07-01T00:00:00Z","allowed_uses":["research"]}'
+
+# 作废收紧的那条 -> seq=3（false -> true，重新露出 sub-demo-c2）
+curl -s -X POST http://localhost:8000/license-changes/revocations -H 'Content-Type: application/json' \
+  -d '{"change_id":"sub-demo-c3","revocation_id":"sub-demo-rev-c3","reason":"收紧登记有误，撤回"}'
+```
+
+**按订阅标识与序号游标读取事件**（稳定顺序、可续读）：
+
+```bash
+# 从头读，每页最多 2 条
+curl -s "http://localhost:8000/permissions/subscriptions/approval-watch-review-2026-09/events?after_seq=0&limit=2"
+```
+
+```json
+{
+  "subscription_id": "approval-watch-review-2026-09",
+  "after_seq": 0,
+  "limit": 2,
+  "events": [
+    {
+      "seq": 1,
+      "trigger_kind": "license_change",
+      "trigger_id": "sub-demo-c2",
+      "change_id": "sub-demo-c2",
+      "effective_at": "2026-06-01T00:00:00Z",
+      "before_allowed": false,
+      "after_allowed": true,
+      "before_blockers": [ { "version_id": "sub-demo-v1", "reason": "use_not_allowed", "change_id": "sub-demo-c1" } ],
+      "after_blockers": [],
+      "created_at": "2026-10-05T10:01:00.000000Z"
+    },
+    { "seq": 2, "trigger_kind": "license_change", "trigger_id": "sub-demo-c3", "change_id": "sub-demo-c3", "effective_at": "2026-07-01T00:00:00Z", "before_allowed": true, "after_allowed": false, "before_blockers": [], "after_blockers": [ { "version_id": "sub-demo-v1", "reason": "use_not_allowed", "change_id": "sub-demo-c3" } ], "created_at": "..." }
+  ],
+  "next_cursor": 2,
+  "has_more": true
+}
+```
+
+- 用返回的 `next_cursor` 作为下一次的 `after_seq` 续读（上例再取 `after_seq=2` 得到 seq=3）；无更多事件时 `events=[]`、`has_more=false`、`next_cursor` 回显当前游标；
+- 顺序恒为序号升序，重复翻页不会重放或跳过事件；`limit` 范围 1–1000（默认 100）。
+
+**基线不可变、只追加事件**：订阅建立后许可如何变化，`GET /permissions/subscriptions/{id}` 与同输入重试都恒返回**建立时**的基线；之后的变化只体现在事件流里，且事件行同样是**不可变历史**（任何接口都不更新/删除）。订阅晚于某次变更建立时，**不会回填**该变更——事件只从建立之后的真实触发开始累积。
+
+| 情形 | 结果 |
+| --- | --- |
+| 首次建立订阅（基线允许或拒绝） | `201`，`replayed=false`，基线原子固化 |
+| 同标识 + 同版本 + 同用途（去空格）+ 同时刻（UTC 归一化）重试 | `200`，`replayed=true`，返回原订阅（含首次 `created_at` 与基线） |
+| 标识复用到不同输入（版本/用途/时刻任一不同） | `409 conflict`，原订阅与事件流不变 |
+| 订阅标识不存在（GET 订阅 / GET 事件流） | `404 not_found` |
+| 版本不存在 | `404 not_found`，不留订阅 |
+| 用途为空白 | `422`，不留订阅 |
+| `at` 无时区或无法解析 | `422 invalid_time`，不留订阅 |
+| 变更/作废的同标识重试 | 返回原记录（`200 replayed=true`），**不追加任何事件** |
+| 变更未翻转某订阅（晚于固定时刻生效/被更晚变更覆盖/仅依据变化而允许状态不变） | 不追加事件 |
+| 游标 `after_seq < 0` 或 `limit < 1` | `422` |
+
+**并发保证**：建立订阅、提交变更、作废都在进程级锁与单个写事务内完成；订阅的「基线固化」与变更/作废的「翻转事件追加」不可能交错。多个订阅与一次变更并发时，每个订阅要么在基线中已看到新状态（无事件），要么固化旧状态后在同事务恰得一条翻转事件；多个作废标识并发作废同一变更时恰一个成功，也恰追加一次翻转。事件主键 `(subscription_id, seq)` 与每订阅的序号分配都在同一写事务内，**一次翻转不漏计、不重复计入**。
+
+```bash
+# 按订阅标识追溯基线（恒为建立当时结果）
+curl -s http://localhost:8000/permissions/subscriptions/approval-watch-review-2026-09
+
+# 续读翻转事件
+curl -s "http://localhost:8000/permissions/subscriptions/approval-watch-review-2026-09/events?after_seq=2&limit=10"
+```
+
+### 9. 导出用途判定凭证的离线审计证明包（签名固定）
 
 `POST /permissions/vouchers/{voucher_id}/proof` · `GET /permissions/vouchers/{voucher_id}/proof`
 
@@ -494,7 +624,7 @@ curl -s http://localhost:8000/permissions/vouchers/approval-2026-03-research-001
 | 凭证存在但从未导出（GET） | `404 not_found`，`details.reason=proof_not_exported` |
 | 签名密钥缺失/损坏/密钥目录不可写 | `503 signing_key_unavailable`（明确报错；其他接口不受影响） |
 
-### 9. 签发公钥与本地持久密钥轮换
+### 10. 签发公钥与本地持久密钥轮换
 
 `GET /signing/keys` · `GET /signing/keys/{key_id}/public` · `POST /signing/keys/rotate`
 
@@ -520,7 +650,7 @@ curl -s -X POST http://localhost:8000/signing/keys/rotate
 
 > 备份时请同时备份数据库与 `SIGNING_KEYS_DIR`；**私钥丢失后历史证明包无法由本服务重新出具**（已分发的证明包仍可用已取得的公钥核验）。轮换端点无内建鉴权，暴露到不可信网络时应放在管理网络/反向代理鉴权之后。
 
-### 10. 离线验签示例（无需服务在线）
+### 11. 离线验签示例（无需服务在线）
 
 `examples/offline-verify-proof.py` 只依赖 `cryptography`（`pip install cryptography`），不导入本服务任何代码，可在审计方离线环境运行，接受**裸证明包**或 `POST` 导出的 `{replayed, proof}` 包装：
 
@@ -550,7 +680,7 @@ python3 examples/offline-verify-proof.py \
 ❌ 验签失败：签名与载荷/公钥不匹配（字段可能被篡改）
 ```
 
-### 11. 查询接口
+### 12. 查询接口
 
 | 方法与路径 | 说明 |
 | --- | --- |
@@ -561,6 +691,9 @@ python3 examples/offline-verify-proof.py \
 | `GET /license-changes/revocations/{revocation_id}` | 按作废标识追溯作废回执，不存在返回 `404` |
 | `POST /permissions/vouchers` | 把一次用途判定原子签发为可追溯凭证（首次 `201` / 同输入重试 `200` / 输入冲突 `409`） |
 | `GET /permissions/vouchers/{voucher_id}` | 追溯凭证，恒返回首次保存的判定；不存在返回 `404` |
+| `POST /permissions/subscriptions` | 建立许可结果订阅并原子固化基线（首次 `201` / 同输入重试 `200` / 输入冲突 `409` / 未知版本 `404` / 空用途或无时区 `422`） |
+| `GET /permissions/subscriptions/{subscription_id}` | 按订阅标识取回不可变基线；不存在返回 `404` |
+| `GET /permissions/subscriptions/{subscription_id}/events` | 按订阅标识与序号游标（`after_seq`/`limit`）读取翻转事件，稳定升序并返回 `next_cursor`/`has_more`；未知订阅 `404` |
 | `POST /permissions/vouchers/{voucher_id}/proof` | 按凭证标识导出固定签名证明包（首次 `201` / 重复或并发 `200` / 未知凭证 `404` / 密钥不可用 `503`） |
 | `GET /permissions/vouchers/{voucher_id}/proof` | 取回已固化的证明包（不签名、不重签）；未导出过 `404 proof_not_exported` |
 | `GET /signing/keys` | 列出全部保留的签发公钥（含轮换前旧公钥）与当前活跃密钥标识 |
@@ -604,4 +737,4 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-测试覆盖：父引用存在性与不可变、祖先展开（含菱形去重）、用途交集、无有效许可阻断、最近变更生效、幂等重放、两类 409 冲突、时区校验、示例数据初始化，变更预演（目标与后代翻转、查询早于生效时刻/更晚变更覆盖不误报、重放无影响、冲突与 404 错误语义、菱形后代只计一次、预演不写入、并发提交下快照不混用），区间分段判定（变更边界切分、起点变更立即生效/终点变更不计入、无有效许可持续拒绝、菱形闭包去重、每段全部阻断版本与原因、与单时刻判定逐点一致、未知版本 404、无时区与倒置/空区间 422），许可变更作废（回执字段与追溯、同标识同内容重试返回原回执、标识复用内容不同/另一标识重复作废两类 409、目标不存在 404、原变更仍可查且带作废标记、单时点与区间判定对所有时刻忽略已作废变更、作废唯一变更后无有效许可阻断、祖先作废阻断后代、重放不能恢复、预演基于作废后快照且不落库、并发同标识重试恰一次创建、示例数据端到端），以及用途判定凭证（允许与拒绝都留痕、凭证内容与实时判定逐字段一致、去空格用途与 UTC 时刻归一化后同输入重试返回原凭证、标识复用到不同输入三类 409、未知凭证/未知版本 404、空用途/无时区 422 且不留凭证、省略标识自动生成、变更收紧与作废后历史凭证不可改写、并发同标识恰一次签发、示例数据端到端），和离线审计证明包与签名密钥（首次导出 201 且包内含完整快照/算法/密钥标识/签名/验签规则、独立公钥（端点 PEM 与包内 PEM）验签通过、重复与并发导出逐字段同一内容且恰一次固化、未知凭证 POST/GET 均 404 且不留行、未导出 GET 为 404 proof_not_exported、历史凭证在许可变更/作废后仍导出首次快照、篡改版本/用途/判定时刻/登记时刻/允许结果/祖先顺序/依据/阻断原因/用途交集/签名字节均验签失败、轮换后旧包不重签且用旧公钥仍可验签、用新公钥交叉验签失败、轮换后新包用新密钥、旧公钥标记非活跃且仍可取回、密钥目录不可用时导出/轮换明确 503 且其他接口照常、密钥文件丢失/损坏/指针缺失的启动自愈与报错、证明包与密钥跨重启持久、规范 JSON 与 base64url 编码确定性、示例数据端到端）。
+测试覆盖：父引用存在性与不可变、祖先展开（含菱形去重）、用途交集、无有效许可阻断、最近变更生效、幂等重放、两类 409 冲突、时区校验、示例数据初始化，变更预演（目标与后代翻转、查询早于生效时刻/更晚变更覆盖不误报、重放无影响、冲突与 404 错误语义、菱形后代只计一次、预演不写入、并发提交下快照不混用），区间分段判定（变更边界切分、起点变更立即生效/终点变更不计入、无有效许可持续拒绝、菱形闭包去重、每段全部阻断版本与原因、与单时刻判定逐点一致、未知版本 404、无时区与倒置/空区间 422），许可变更作废（回执字段与追溯、同标识同内容重试返回原回执、标识复用内容不同/另一标识重复作废两类 409、目标不存在 404、原变更仍可查且带作废标记、单时点与区间判定对所有时刻忽略已作废变更、作废唯一变更后无有效许可阻断、祖先作废阻断后代、重放不能恢复、预演基于作废后快照且不落库、并发同标识重试恰一次创建、示例数据端到端），以及用途判定凭证（允许与拒绝都留痕、凭证内容与实时判定逐字段一致、去空格用途与 UTC 时刻归一化后同输入重试返回原凭证、标识复用到不同输入三类 409、未知凭证/未知版本 404、空用途/无时区 422 且不留凭证、省略标识自动生成、变更收紧与作废后历史凭证不可改写、并发同标识恰一次签发、示例数据端到端），和许可结果订阅与翻转事件流（建立时基线允许/拒绝均原子固化且含全部阻断原因、同版本+去空格用途+UTC 同时刻重试返回原订阅、标识复用到不同版本/用途/时刻 409、未知订阅/未知版本 404、空用途/无时区 422 且不留订阅、变更与作废在同一事务内对自身及全部后代重判且仅状态翻转追加事件、祖先阻断与菱形后代只计一次、事件序号每订阅从 1 递增且记录触发操作/前后状态/前后阻断原因、变更晚于固定时刻或被更晚变更覆盖或仅依据变化时不追加、作废后重新露出更早变更的双向翻转链、变更与作废重试不产生重复事件、游标分页稳定升序且 next_cursor/has_more 续读不重不漏、晚建立的订阅不回填历史、省略标识自动生成、订阅与变更并发每订阅恰零或一条翻转、同标识订阅并发恰一次建立、多标识并发作废恰一次成功且恰一次翻转、示例数据端到端），和离线审计证明包与签名密钥（首次导出 201 且包内含完整快照/算法/密钥标识/签名/验签规则、独立公钥（端点 PEM 与包内 PEM）验签通过、重复与并发导出逐字段同一内容且恰一次固化、未知凭证 POST/GET 均 404 且不留行、未导出 GET 为 404 proof_not_exported、历史凭证在许可变更/作废后仍导出首次快照、篡改版本/用途/判定时刻/登记时刻/允许结果/祖先顺序/依据/阻断原因/用途交集/签名字节均验签失败、轮换后旧包不重签且用旧公钥仍可验签、用新公钥交叉验签失败、轮换后新包用新密钥、旧公钥标记非活跃且仍可取回、密钥目录不可用时导出/轮换明确 503 且其他接口照常、密钥文件丢失/损坏/指针缺失的启动自愈与报错、证明包与密钥跨重启持久、规范 JSON 与 base64url 编码确定性、示例数据端到端）。

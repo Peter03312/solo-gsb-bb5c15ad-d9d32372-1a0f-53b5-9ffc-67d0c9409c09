@@ -91,12 +91,55 @@ SCHEMA_STATEMENTS = [
         proof_json      TEXT NOT NULL
     )
     """,
+    # A permission subscription watches one fixed permission decision: a
+    # unique subscription id plus the registered version, the trimmed use and
+    # the timezone-aware decision instant (normalised to UTC). At creation the
+    # then-current decision is atomically frozen as the immutable baseline
+    # (allow/deny plus the blockers with their reasons). Rows are never updated
+    # or deleted; subsequent license changes/revocations only append events.
+    """
+    CREATE TABLE IF NOT EXISTS permission_subscriptions (
+        subscription_id  TEXT PRIMARY KEY,
+        version_id       TEXT NOT NULL REFERENCES versions(version_id),
+        use_name         TEXT NOT NULL,
+        at_value         TEXT NOT NULL,
+        created_at       TEXT NOT NULL,
+        baseline_allowed INTEGER NOT NULL,
+        baseline_json    TEXT NOT NULL
+    )
+    """,
+    # Every row is exactly one allow<->deny flip of one subscription, appended
+    # in the SAME write transaction as the license change/revocation that
+    # caused it. Sequence numbers are per subscription and start at 1; the
+    # (subscription_id, seq) primary key both fixes the stable read order and
+    # guarantees a retried/duplicated trigger can never append twice. Rows are
+    # immutable history — no API ever updates or deletes them.
+    """
+    CREATE TABLE IF NOT EXISTS subscription_events (
+        subscription_id     TEXT NOT NULL REFERENCES permission_subscriptions(subscription_id),
+        seq                 INTEGER NOT NULL,
+        trigger_kind        TEXT NOT NULL,
+        trigger_id          TEXT NOT NULL,
+        change_id           TEXT NOT NULL,
+        effective_at        TEXT,
+        before_allowed      INTEGER NOT NULL,
+        after_allowed       INTEGER NOT NULL,
+        before_blockers_json TEXT NOT NULL,
+        after_blockers_json  TEXT NOT NULL,
+        created_at          TEXT NOT NULL,
+        PRIMARY KEY (subscription_id, seq)
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_changes_version_time "
     "ON license_changes(version_id, effective_at)",
     "CREATE INDEX IF NOT EXISTS idx_parents_version ON version_parents(version_id)",
     "CREATE INDEX IF NOT EXISTS idx_parents_parent ON version_parents(parent_id)",
     "CREATE INDEX IF NOT EXISTS idx_revocations_change ON change_revocations(change_id)",
     "CREATE INDEX IF NOT EXISTS idx_vouchers_version ON permission_vouchers(version_id)",
+    "CREATE INDEX IF NOT EXISTS idx_subscriptions_version "
+    "ON permission_subscriptions(version_id)",
+    "CREATE INDEX IF NOT EXISTS idx_sub_events_subscription "
+    "ON subscription_events(subscription_id, seq)",
 ]
 
 
@@ -371,4 +414,133 @@ class Database:
             "(voucher_id, key_id, algorithm, exported_at, proof_json) "
             "VALUES (?, ?, ?, ?, ?)",
             (voucher_id, key_id, algorithm, exported_at, proof_json),
+        )
+
+    # -- permission subscriptions -----------------------------------------
+
+    def get_subscription(self, subscription_id: str) -> dict[str, Any] | None:
+        return self.query_one(
+            "SELECT * FROM permission_subscriptions WHERE subscription_id = ?",
+            (subscription_id,),
+        )
+
+    def list_subscriptions_for_versions(self, version_ids: list[str]) -> list[dict[str, Any]]:
+        """All subscriptions watched on any of ``version_ids``.
+
+        Called inside a write transaction after a change/revocation; a change
+        on a version can only flip subscriptions on that version itself or its
+        descendants (the caller passes the full deduplicated closure), so this
+        candidate set plus the in-memory closure is exact.
+        """
+        if not version_ids:
+            return []
+        placeholders = ",".join("?" for _ in version_ids)
+        return self.query_all(
+            f"SELECT * FROM permission_subscriptions WHERE version_id IN ({placeholders}) "
+            "ORDER BY created_at, subscription_id",
+            tuple(version_ids),
+        )
+
+    def insert_subscription(
+        self,
+        subscription_id: str,
+        version_id: str,
+        use_name: str,
+        at_value: str,
+        created_at: str,
+        baseline_allowed: bool,
+        baseline_json: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO permission_subscriptions "
+            "(subscription_id, version_id, use_name, at_value, created_at, "
+            "baseline_allowed, baseline_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                subscription_id,
+                version_id,
+                use_name,
+                at_value,
+                created_at,
+                1 if baseline_allowed else 0,
+                baseline_json,
+            ),
+        )
+
+    # -- subscription flip events -----------------------------------------
+
+    def latest_subscription_events(self, subscription_ids: list[str]) -> dict[str, Any]:
+        """Latest event row per subscription id (no rows -> baseline).
+
+        One window-function read keeps "current allowed/blockers" of every
+        candidate consistent with the surrounding transaction snapshot.
+        """
+        if not subscription_ids:
+            return {}
+        placeholders = ",".join("?" for _ in subscription_ids)
+        rows = self.query_all(
+            f"""
+            SELECT * FROM (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY subscription_id ORDER BY seq DESC
+                ) AS rn
+                FROM subscription_events
+                WHERE subscription_id IN ({placeholders})
+            ) WHERE rn = 1
+            """,
+            tuple(subscription_ids),
+        )
+        return {row["subscription_id"]: row for row in rows}
+
+    def next_event_seq(self, subscription_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq "
+            "FROM subscription_events WHERE subscription_id = ?",
+            (subscription_id,),
+        ).fetchone()
+        return int(row["next_seq"])
+
+    def insert_subscription_event(
+        self,
+        subscription_id: str,
+        seq: int,
+        trigger_kind: str,
+        trigger_id: str,
+        change_id: str,
+        effective_at: str | None,
+        before_allowed: bool,
+        after_allowed: bool,
+        before_blockers_json: str,
+        after_blockers_json: str,
+        created_at: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO subscription_events "
+            "(subscription_id, seq, trigger_kind, trigger_id, change_id, "
+            "effective_at, before_allowed, after_allowed, "
+            "before_blockers_json, after_blockers_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                subscription_id,
+                seq,
+                trigger_kind,
+                trigger_id,
+                change_id,
+                effective_at,
+                1 if before_allowed else 0,
+                1 if after_allowed else 0,
+                before_blockers_json,
+                after_blockers_json,
+                created_at,
+            ),
+        )
+
+    def list_subscription_events(
+        self, subscription_id: str, after_seq: int, limit: int
+    ) -> list[dict[str, Any]]:
+        """Stable, cursor-ordered event page: strictly increasing seq."""
+        return self.query_all(
+            "SELECT * FROM subscription_events "
+            "WHERE subscription_id = ? AND seq > ? "
+            "ORDER BY seq ASC LIMIT ?",
+            (subscription_id, after_seq, limit),
         )
